@@ -1,0 +1,3132 @@
+From 49cb5de39eedf270acf7e9722e3921da251a7bc8 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Mon, 22 Mar 2010 13:00:58 -0400
+Subject: [PATCH 1/9] Allow saved-session directory to be a symlink
+
+This gives us the option of adding a rudimentary session
+chooser later.
+---
+ gnome-session/gsm-session-save.c |   30 +++---------------------------
+ gnome-session/gsm-util.c         |    6 ------
+ 2 files changed, 3 insertions(+), 33 deletions(-)
+
+diff --git a/gnome-session/gsm-session-save.c b/gnome-session/gsm-session-save.c
+index b31d9fa..845ff32 100644
+--- a/gnome-session/gsm-session-save.c
++++ b/gnome-session/gsm-session-save.c
+@@ -118,7 +118,6 @@ gsm_session_save (GsmStore  *client_store,
+                   GError   **error)
+ {
+         const char      *save_dir;
+-        char            *tmp_dir;
+         SessionSaveData  data;
+ 
+         g_debug ("GsmSessionSave: Saving session");
+@@ -129,41 +128,18 @@ gsm_session_save (GsmStore  *client_store,
+                 return;
+         }
+ 
+-        tmp_dir = gsm_util_get_empty_tmp_session_dir ();
+-        if (tmp_dir == NULL) {
+-                g_warning ("GsmSessionSave: cannot create new saved session directory");
+-                return;
+-        }
+-
+-        /* save the session in a temp directory, and remember the discard
+-         * commands */
+-        data.dir = tmp_dir;
++        data.dir = save_dir;
+         data.discard_hash = g_hash_table_new_full (g_str_hash, g_str_equal,
+                                                    g_free, NULL);
++        /* remove the old saved session */
++        gsm_session_clear_saved_session (save_dir, data.discard_hash);
+         data.error = error;
+ 
+         gsm_store_foreach (client_store,
+                            (GsmStoreFunc) save_one_client,
+                            &data);
+ 
+-        if (!*error) {
+-                /* remove the old saved session */
+-                gsm_session_clear_saved_session (save_dir, data.discard_hash);
+-
+-                /* rename the temp session dir */
+-                if (g_file_test (save_dir, G_FILE_TEST_IS_DIR))
+-                        g_rmdir (save_dir);
+-                g_rename (tmp_dir, save_dir);
+-        } else {
+-                g_warning ("GsmSessionSave: error saving session: %s", (*error)->message);
+-                /* FIXME: we should create a hash table filled with the discard
+-                 * commands that are in desktop files from save_dir. */
+-                gsm_session_clear_saved_session (tmp_dir, NULL);
+-                g_rmdir (tmp_dir);
+-        }
+-
+         g_hash_table_destroy (data.discard_hash);
+-        g_free (tmp_dir);
+ }
+ 
+ static gboolean
+diff --git a/gnome-session/gsm-util.c b/gnome-session/gsm-util.c
+index d139b95..23be27f 100644
+--- a/gnome-session/gsm-util.c
++++ b/gnome-session/gsm-util.c
+@@ -125,15 +125,9 @@ gsm_util_find_desktop_file_for_app_name (const char *name,
+ static gboolean
+ ensure_dir_exists (const char *dir)
+ {
+-        if (g_file_test (dir, G_FILE_TEST_IS_DIR))
+-                return TRUE;
+-
+         if (g_mkdir_with_parents (dir, 0755) == 0)
+                 return TRUE;
+ 
+-        if (errno == EEXIST)
+-                return g_file_test (dir, G_FILE_TEST_IS_DIR);
+-
+         g_warning ("GsmSessionSave: Failed to create directory %s: %s", dir, strerror (errno));
+ 
+         return FALSE;
+-- 
+1.6.5.2
+
+
+From fb471feaf10066367c2499b31923873b3826d5ea Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Mon, 22 Mar 2010 13:10:29 -0400
+Subject: [PATCH 2/9] Add new autosave_one_shot gconf key
+
+This initiates a save for the next session without changing
+the users default settings for session autosaving.
+---
+ data/gnome-session.schemas.in.in |   11 +++++++++++
+ gnome-session/gsm-manager.c      |   36 +++++++++++++++++++++++++++++++++---
+ 2 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/data/gnome-session.schemas.in.in b/data/gnome-session.schemas.in.in
+index 2cd5e2d..0a4fe6a 100644
+--- a/data/gnome-session.schemas.in.in
++++ b/data/gnome-session.schemas.in.in
+@@ -25,6 +25,17 @@
+          </locale>
+       </schema>
+       <schema>
++         <key>/schemas/apps/gnome-session/options/auto_save_session_one_shot</key>
++         <applyto>/apps/gnome-session/options/auto_save_session_one_shot</applyto>
++         <owner>gnome</owner>
++         <type>bool</type>
++         <default>false</default>
++         <locale name="C">
++            <short>Save sessions</short>
++            <long>When enabled, gnome-session will automatically save the next session at log out even if auto saving is disabled.</long>
++         </locale>
++      </schema>
++      <schema>
+          <key>/schemas/apps/gnome-session/options/logout_prompt</key>
+          <applyto>/apps/gnome-session/options/logout_prompt</applyto>
+          <owner>gnome</owner>
+diff --git a/gnome-session/gsm-manager.c b/gnome-session/gsm-manager.c
+index 49fefe6..d550f70 100644
+--- a/gnome-session/gsm-manager.c
++++ b/gnome-session/gsm-manager.c
+@@ -81,6 +81,7 @@
+ #define KEY_IDLE_DELAY            KEY_DESKTOP_DIR "/idle_delay"
+ 
+ #define KEY_GNOME_SESSION_DIR     "/apps/gnome-session/options"
++#define KEY_AUTOSAVE_ONE_SHOT     KEY_GNOME_SESSION_DIR "/auto_save_session_one_shot"
+ #define KEY_AUTOSAVE              KEY_GNOME_SESSION_DIR "/auto_save_session"
+ 
+ #define KEY_SLEEP_LOCK            "/apps/gnome-screensaver/lock_enabled"
+@@ -402,11 +403,25 @@ quit_request_completed (GsmConsolekit *consolekit,
+ static void
+ gsm_manager_quit (GsmManager *manager)
+ {
++        GError *error;
+         GsmConsolekit *consolekit;
+ 
+         /* See the comment in request_reboot() for some more details about how
+          * this works. */
+ 
++        /* Clear one shot key autosave in the event its set (so that it's actually
++         * one shot only)
++         */
++        error = NULL;
++        if (!gconf_client_set_bool (manager->priv->gconf_client,
++                                    KEY_AUTOSAVE_ONE_SHOT,
++                                    FALSE,
++                                    &error)) {
++                g_warning ("Error clearing configuration key '%s': %s",
++                           KEY_AUTOSAVE_ONE_SHOT,
++                           error->message);
++        }
++
+         switch (manager->priv->logout_type) {
+         case GSM_MANAGER_LOGOUT_LOGOUT:
+                 gtk_main_quit ();
+@@ -1811,19 +1826,34 @@ auto_save_is_enabled (GsmManager *manager)
+ 
+         error = NULL;
+         auto_save = gconf_client_get_bool (manager->priv->gconf_client,
+-                                           KEY_AUTOSAVE,
++                                           KEY_AUTOSAVE_ONE_SHOT,
+                                            &error);
+ 
+         if (error) {
+                 g_warning ("Error retrieving configuration key '%s': %s",
+-                           KEY_AUTOSAVE,
++                           KEY_AUTOSAVE_ONE_SHOT,
+                            error->message);
+                 g_error_free (error);
+ 
+-                /* If we fail to query gconf key, disable auto save */
+                 auto_save = FALSE;
+         }
+ 
++        if (!auto_save) {
++                auto_save = gconf_client_get_bool (manager->priv->gconf_client,
++                                                   KEY_AUTOSAVE,
++                                                   &error);
++
++                if (error) {
++                        g_warning ("Error retrieving configuration key '%s': %s",
++                                   KEY_AUTOSAVE,
++                                   error->message);
++                        g_error_free (error);
++
++                        /* If we fail to query gconf key, disable auto save */
++                        auto_save = FALSE;
++                }
++        }
++
+         return auto_save;
+ }
+ 
+-- 
+1.6.5.2
+
+
+From 62b6d2587d00e82fb55746bcc9bdbffedc28752c Mon Sep 17 00:00:00 2001
+From: Matthias Clasen <mclasen@redhat.com>
+Date: Mon, 22 Mar 2010 13:12:17 -0400
+Subject: [PATCH 3/9] Add new custom session selector
+
+This allows the user to define and switch between separate saved
+sessions.
+---
+ configure.in                         |   14 +
+ data/Makefile.am                     |   10 +-
+ data/gnome-custom-session.desktop.in |    5 +
+ data/session-selector.ui             |  341 ++++++++++++++++++
+ doc/man/Makefile.am                  |    3 +-
+ doc/man/gnome-session-selector.1     |   26 ++
+ po/POTFILES.in                       |    3 +
+ tools/Makefile.am                    |   16 +-
+ tools/gnome-session-custom-session   |    4 +
+ tools/gnome-session-selector.c       |  628 ++++++++++++++++++++++++++++++++++
+ 10 files changed, 1047 insertions(+), 3 deletions(-)
+ create mode 100644 data/gnome-custom-session.desktop.in
+ create mode 100644 data/session-selector.ui
+ create mode 100644 doc/man/gnome-session-selector.1
+ create mode 100644 tools/gnome-session-custom-session
+ create mode 100644 tools/gnome-session-selector.c
+
+diff --git a/configure.in b/configure.in
+index ef7c6dd..dca9d3a 100644
+--- a/configure.in
++++ b/configure.in
+@@ -71,6 +71,20 @@ PKG_CHECK_MODULES(COMPAT,
+         gtk+-2.0 >= $GTK_REQUIRED
+         dbus-glib-1 >= $DBUS_GLIB_REQUIRED)
+ 
++AC_ARG_ENABLE(session-selector, AS_HELP_STRING([--enable-session-selector],
++                                               [enable building a custom session selector dialog]),
++                                                enable_session_selector=$enableval,enable_session_selector=no)
++
++AM_CONDITIONAL(BUILD_SESSION_SELECTOR,
++               [test "$enable_session_selector" = yes])
++
++if test "$enable_session_selector" = yes; then
++        PKG_CHECK_MODULES(SESSION_SELECTOR,
++                          gtk+-2.0 >= 2.18
++                          gmodule-export-2.0
++                          gconf-2.0)
++fi
++
+ PKG_CHECK_MODULES(SM, sm)
+ PKG_CHECK_MODULES(ICE, ice)
+ PKG_CHECK_MODULES(XEXT, xext xau)
+diff --git a/data/Makefile.am b/data/Makefile.am
+index 8899c5b..6986bbd 100644
+--- a/data/Makefile.am
++++ b/data/Makefile.am
+@@ -6,12 +6,20 @@ uidir = $(pkgdatadir)
+ ui_DATA = \
+ 	session-properties.ui	\
+ 	gsm-inhibit-dialog.ui	\
++	session-selector.ui	\
+ 	$(NULL)
+ 
+ @INTLTOOL_DESKTOP_RULE@
+ 
+ xsessiondir = $(datadir)/xsessions
+-xsession_in_files = gnome.desktop.in
++xsession_in_files = \
++	gnome.desktop.in		\
++	$(NULL)
++
++if BUILD_SESSION_SELECTOR
++xsession_in_files += gnome-custom-session.desktop.in
++endif
++
+ xsession_DATA = $(xsession_in_files:.desktop.in=.desktop)
+ 
+ @INTLTOOL_SCHEMAS_RULE@
+diff --git a/data/gnome-custom-session.desktop.in b/data/gnome-custom-session.desktop.in
+new file mode 100644
+index 0000000..ae36952
+--- /dev/null
++++ b/data/gnome-custom-session.desktop.in
+@@ -0,0 +1,5 @@
++[Desktop Entry]
++_Name=Custom
++_Comment=This entry lets you select a saved session
++Exec=gnome-session-custom-session
++TryExec=gnome-session-custom-session
+diff --git a/data/session-selector.ui b/data/session-selector.ui
+new file mode 100644
+index 0000000..0d4ec57
+--- /dev/null
++++ b/data/session-selector.ui
+@@ -0,0 +1,341 @@
++<?xml version="1.0"?>
++<interface>
++  <requires lib="gtk+" version="2.16"/>
++  <!-- interface-naming-policy project-wide -->
++  <object class="GtkListStore" id="session-store">
++    <columns>
++      <!-- column-name name -->
++      <column type="gchararray"/>
++    </columns>
++  </object>
++  <object class="GtkTreeModelSort" id="sort-model">
++    <property name="model">session-store</property>
++  </object>
++  <object class="GtkWindow" id="main-window">
++    <property name="border_width">5</property>
++    <property name="title" translatable="yes">Custom Session</property>
++    <property name="window_position">center</property>
++    <property name="default_width">500</property>
++    <property name="default_height">300</property>
++    <child>
++      <object class="GtkNotebook" id="main-notebook">
++        <property name="visible">True</property>
++        <property name="show_tabs">False</property>
++        <child>
++          <object class="GtkVBox" id="vbox3">
++            <property name="visible">True</property>
++            <property name="border_width">5</property>
++            <property name="orientation">vertical</property>
++            <property name="spacing">12</property>
++            <child>
++              <object class="GtkVBox" id="vbox4">
++                <property name="visible">True</property>
++                <property name="orientation">vertical</property>
++                <property name="spacing">12</property>
++                <child>
++                  <object class="GtkLabel" id="label4">
++                    <property name="visible">True</property>
++                    <property name="label" translatable="yes">Please choose a custom session to run.</property>
++                  </object>
++                  <packing>
++                    <property name="expand">False</property>
++                    <property name="position">0</property>
++                  </packing>
++                </child>
++                <child>
++                  <object class="GtkHBox" id="hbox3">
++                    <property name="visible">True</property>
++                    <property name="spacing">12</property>
++                    <child>
++                      <object class="GtkScrolledWindow" id="scrolledwindow2">
++                        <property name="visible">True</property>
++                        <property name="can_focus">True</property>
++                        <property name="hscrollbar_policy">never</property>
++                        <property name="vscrollbar_policy">automatic</property>
++                        <property name="shadow_type">in</property>
++                        <child>
++                          <object class="GtkTreeView" id="session-list">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="model">sort-model</property>
++                            <property name="headers_visible">False</property>
++                            <property name="search_column">0</property>
++                          </object>
++                        </child>
++                      </object>
++                      <packing>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="GtkVButtonBox" id="vbuttonbox2">
++                        <property name="visible">True</property>
++                        <property name="orientation">vertical</property>
++                        <property name="spacing">6</property>
++                        <property name="layout_style">start</property>
++                        <child>
++                          <object class="GtkButton" id="new-session">
++                            <property name="label" translatable="yes">_New Session</property>
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="receives_default">True</property>
++                            <property name="use_underline">True</property>
++                          </object>
++                          <packing>
++                            <property name="expand">False</property>
++                            <property name="fill">False</property>
++                            <property name="position">0</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkButton" id="remove-session">
++                            <property name="label" translatable="yes">_Remove Session</property>
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="receives_default">True</property>
++                            <property name="use_underline">True</property>
++                          </object>
++                          <packing>
++                            <property name="expand">False</property>
++                            <property name="fill">False</property>
++                            <property name="position">1</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label1">
++                            <property name="visible">True</property>
++                          </object>
++                          <packing>
++                            <property name="expand">False</property>
++                            <property name="fill">False</property>
++                            <property name="position">2</property>
++                          </packing>
++                        </child>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="position">1</property>
++                      </packing>
++                    </child>
++                  </object>
++                  <packing>
++                    <property name="position">1</property>
++                  </packing>
++                </child>
++              </object>
++              <packing>
++                <property name="position">0</property>
++              </packing>
++            </child>
++            <child>
++              <object class="GtkHButtonBox" id="hbuttonbox2">
++                <property name="visible">True</property>
++                <property name="spacing">6</property>
++                <property name="layout_style">end</property>
++                <child>
++                  <object class="GtkButton" id="continue-button">
++                    <property name="label" translatable="yes">_Continue</property>
++                    <property name="visible">True</property>
++                    <property name="can_focus">True</property>
++                    <property name="can_default">True</property>
++                    <property name="has_default">True</property>
++                    <property name="receives_default">True</property>
++                    <property name="use_underline">True</property>
++                  </object>
++                  <packing>
++                    <property name="expand">False</property>
++                    <property name="fill">False</property>
++                    <property name="position">0</property>
++                  </packing>
++                </child>
++              </object>
++              <packing>
++                <property name="expand">False</property>
++                <property name="position">1</property>
++              </packing>
++            </child>
++          </object>
++        </child>
++        <child type="tab">
++          <placeholder/>
++        </child>
++        <child>
++          <object class="GtkVBox" id="vbox5">
++            <property name="visible">True</property>
++            <property name="border_width">5</property>
++            <property name="orientation">vertical</property>
++            <property name="spacing">2</property>
++            <child>
++              <object class="GtkVBox" id="vbox1">
++                <property name="visible">True</property>
++                <property name="orientation">vertical</property>
++                <property name="spacing">12</property>
++                <child>
++                  <object class="GtkLabel" id="label2">
++                    <property name="visible">True</property>
++                    <property name="label" translatable="yes">Please enter a name for the new session.</property>
++                  </object>
++                  <packing>
++                    <property name="expand">False</property>
++                    <property name="position">0</property>
++                  </packing>
++                </child>
++                <child>
++                  <object class="GtkAlignment" id="alignment1">
++                    <property name="visible">True</property>
++                    <property name="xalign">0</property>
++                    <property name="yalign">0</property>
++                    <property name="yscale">0</property>
++                    <child>
++                      <object class="GtkTable" id="table1">
++                        <property name="visible">True</property>
++                        <property name="n_rows">2</property>
++                        <property name="n_columns">2</property>
++                        <property name="column_spacing">6</property>
++                        <property name="row_spacing">6</property>
++                        <child>
++                          <object class="GtkLabel" id="label5">
++                            <property name="visible">True</property>
++                            <property name="xalign">1</property>
++                            <property name="label" translatable="yes">_Name:</property>
++                            <property name="use_underline">True</property>
++                            <property name="mnemonic_widget">name-entry</property>
++                          </object>
++                          <packing>
++                            <property name="x_options">GTK_FILL</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkEntry" id="name-entry">
++                            <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="invisible_char">&#x25CF;</property>
++                            <property name="activates_default">True</property>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="right_attach">2</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkLabel" id="label3">
++                            <property name="visible">True</property>
++                            <property name="label">
++</property>
++                          </object>
++                          <packing>
++                            <property name="top_attach">1</property>
++                            <property name="bottom_attach">2</property>
++                            <property name="x_options">GTK_FILL</property>
++                          </packing>
++                        </child>
++                        <child>
++                          <object class="GtkHBox" id="name-invalid-box">
++                            <property name="visible">True</property>
++                            <property name="spacing">6</property>
++                            <child>
++                              <object class="GtkImage" id="image1">
++                                <property name="visible">True</property>
++                                <property name="stock">gtk-dialog-error</property>
++                              </object>
++                              <packing>
++                                <property name="expand">False</property>
++                                <property name="position">0</property>
++                              </packing>
++                            </child>
++                            <child>
++                              <object class="GtkAlignment" id="alignment2">
++                                <property name="visible">True</property>
++                                <property name="yscale">0</property>
++                                <child>
++                                  <object class="GtkLabel" id="name-invalid-label">
++                                    <property name="visible">True</property>
++                                    <property name="xalign">0</property>
++                                    <property name="yalign">1</property>
++                                    <property name="use_markup">True</property>
++                                  </object>
++                                </child>
++                              </object>
++                              <packing>
++                                <property name="position">1</property>
++                              </packing>
++                            </child>
++                          </object>
++                          <packing>
++                            <property name="left_attach">1</property>
++                            <property name="right_attach">2</property>
++                            <property name="top_attach">1</property>
++                            <property name="bottom_attach">2</property>
++                          </packing>
++                        </child>
++                      </object>
++                    </child>
++                  </object>
++                  <packing>
++                    <property name="position">1</property>
++                  </packing>
++                </child>
++                <child>
++                  <object class="GtkHButtonBox" id="hbuttonbox3">
++                    <property name="visible">True</property>
++                    <property name="spacing">6</property>
++                    <property name="layout_style">end</property>
++                    <child>
++                      <object class="GtkButton" id="name-cancel-button">
++                        <property name="label">gtk-cancel</property>
++                        <property name="visible">True</property>
++                        <property name="can_focus">True</property>
++                        <property name="receives_default">True</property>
++                        <property name="use_stock">True</property>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">False</property>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="GtkButton" id="name-ok-button">
++                        <property name="label">gtk-ok</property>
++                        <property name="visible">True</property>
++                        <property name="can_focus">True</property>
++                        <property name="can_default">True</property>
++                        <property name="has_default">True</property>
++                        <property name="receives_default">True</property>
++                        <property name="use_stock">True</property>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">False</property>
++                        <property name="position">1</property>
++                      </packing>
++                    </child>
++                  </object>
++                  <packing>
++                    <property name="expand">False</property>
++                    <property name="position">2</property>
++                  </packing>
++                </child>
++              </object>
++              <packing>
++                <property name="position">0</property>
++              </packing>
++            </child>
++          </object>
++          <packing>
++            <property name="position">1</property>
++          </packing>
++        </child>
++        <child type="tab">
++          <placeholder/>
++        </child>
++        <child>
++          <placeholder/>
++        </child>
++        <child type="tab">
++          <placeholder/>
++        </child>
++      </object>
++    </child>
++  </object>
++</interface>
+diff --git a/doc/man/Makefile.am b/doc/man/Makefile.am
+index 8b66899..83be932 100644
+--- a/doc/man/Makefile.am
++++ b/doc/man/Makefile.am
+@@ -2,7 +2,8 @@ man_MANS =				\
+ 	gnome-session.1			\
+ 	gnome-session-properties.1	\
+ 	gnome-session-save.1		\
+-	gnome-wm.1
++	gnome-wm.1			\
++	gnome-session-selector.1
+ 
+ EXTRA_DIST =			\
+ 	$(man_MANS)
+diff --git a/doc/man/gnome-session-selector.1 b/doc/man/gnome-session-selector.1
+new file mode 100644
+index 0000000..7de9f30
+--- /dev/null
++++ b/doc/man/gnome-session-selector.1
+@@ -0,0 +1,26 @@
++.\" 
++.\" gnome-session-selector manual page.
++.\" (C) 2010 Red Hat, Inc.
++.\"
++.TH GNOME-SESSION-SELECTOR 1 "GNOME"
++.SH NAME
++gnome-session-selector \- Selects a session to use with gnome-session
++.SH SYNOPSIS
++.B gnome-session-selector [session]
++.SH DESCRIPTION
++\fIgnome-session-selector \fP can be used from a xsession desktop file to select
++a session before gnome-session is run. \fIgnome-session\fP reads and stores
++its session in the "${XDG_DATA_HOME}/gnome-session/saved-session" directory.
++\fIgnome-session-selector\fP works by replacing the saved-session directory by a
++symlink to another directory. Since the session name is used as the directory
++name, it may not contain '/' characters or begin with a '.'.
++
++.PP
++When a session name is specified, \fIgnome-session-selector\fP will create a symlink
++to select this session.
++
++When started without arguments, \fIgnome-session-selector\fP will present a dialog
++that allows to choose one of the existing sessions or create a new one.
++
++.SH SEE ALSO
++.BR gnome-session(1)
+diff --git a/po/POTFILES.in b/po/POTFILES.in
+index 5992a1c..1d6769b 100644
+--- a/po/POTFILES.in
++++ b/po/POTFILES.in
+@@ -6,9 +6,11 @@ capplet/gsp-app.c
+ capplet/main.c
+ compat/gnome-settings-daemon-helper.c
+ compat/gnome-settings-daemon-helper.desktop.in.in.in
++data/gnome-custom-session.desktop.in
+ data/gnome.desktop.in
+ data/gnome-session.schemas.in.in
+ data/gnome-wm.desktop.in.in
++[type: gettext/glade]data/session-selector.ui
+ [type: gettext/glade]data/gsm-inhibit-dialog.ui
+ data/session-properties.desktop.in.in
+ [type: gettext/glade]data/session-properties.ui
+@@ -24,4 +26,5 @@ gnome-session/gsm-util.c
+ gnome-session/main.c
+ splash/gnome-session-splash.c
+ splash/gnome-session-splash.desktop.in.in.in
++tools/gnome-session-selector.c
+ tools/gnome-session-save.c
+diff --git a/tools/Makefile.am b/tools/Makefile.am
+index 6d3813f..7f8637b 100644
+--- a/tools/Makefile.am
++++ b/tools/Makefile.am
+@@ -1,11 +1,17 @@
+ bin_PROGRAMS = gnome-session-save
+ 
++if BUILD_SESSION_SELECTOR
++bin_PROGRAMS += gnome-session-selector
++dist_bin_SCRIPTS = gnome-session-custom-session
++endif
++
+ INCLUDES =					\
+ 	$(WARN_CFLAGS)				\
+ 	$(DISABLE_DEPRECATED_CFLAGS)		\
+ 	$(GNOME_SESSION_CFLAGS)			\
+ 	$(DBUS_GLIB_CFLAGS)			\
+-	$(GCONF_FLAGS)				\
++	$(GCONF_CFLAGS)				\
++	-DGTKBUILDER_DIR=\""$(pkgdatadir)"\"	\
+ 	-DLOCALE_DIR=\""$(datadir)/locale"\"
+ 
+ gnome_session_save_LDADD =			\
+@@ -18,4 +24,12 @@ gnome_session_save_LDADD =			\
+ gnome_session_save_SOURCES =			\
+ 	gnome-session-save.c
+ 
++if BUILD_SESSION_SELECTOR
++gnome_session_selector_LDADD = 				\
++	$(SESSION_SELECTOR_LIBS)
++
++gnome_session_selector_SOURCES = 			\
++	gnome-session-selector.c
++endif
++
+ -include $(top_srcdir)/git.mk
+diff --git a/tools/gnome-session-custom-session b/tools/gnome-session-custom-session
+new file mode 100644
+index 0000000..07fdb0c
+--- /dev/null
++++ b/tools/gnome-session-custom-session
+@@ -0,0 +1,4 @@
++#! /bin/sh
++
++gnome-session-selector
++exec gnome-session
+diff --git a/tools/gnome-session-selector.c b/tools/gnome-session-selector.c
+new file mode 100644
+index 0000000..fb715eb
+--- /dev/null
++++ b/tools/gnome-session-selector.c
+@@ -0,0 +1,628 @@
++/* -*- Mode: C; tab-width: 8; indent-tabs-mode: nil; c-basic-offset: 8 -*-
++ *
++ * Copyright 2010  Red Hat, Inc,
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++ *
++ * Written by: Matthias Clasen <mclasen@redhat.com>
++ */
++
++#include "config.h"
++
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <glib.h>
++#include <gtk/gtk.h>
++#include <gconf/gconf-client.h>
++
++#include <glib/gi18n.h>
++
++#define KEY_GNOME_SESSION_DIR     "/apps/gnome-session/options"
++#define KEY_AUTOSAVE_ONE_SHOT     KEY_GNOME_SESSION_DIR "/auto_save_session_one_shot"
++
++static GtkBuilder *builder;
++static GtkWidget *session_list;
++static GtkListStore *store;
++static GtkTreeModelSort *sort_model;
++
++static char *
++get_session_path (const char *name)
++{
++        return g_build_filename (g_get_user_config_dir (), "gnome-session", name, NULL);
++}
++
++static char *
++find_new_session_name (void)
++{
++        char *name;
++        char *path;
++        int i;
++
++        for (i = 1; i < 20; i++) {
++                name = g_strdup_printf (_("Session %d"), i);
++                path = get_session_path (name);
++                if (!g_file_test (path, G_FILE_TEST_EXISTS)) {
++                        g_free (path);
++                        return name;
++                }
++                g_free (path);
++                g_free (name);
++        }
++
++        return NULL;
++}
++
++static gboolean
++is_valid_session_name (const char *name)
++{
++        GtkWidget *warning;
++        GtkWidget *label;
++        GtkTreeIter iter;
++        char *n;
++        char *text;
++
++        warning = (GtkWidget*) gtk_builder_get_object (builder, "name-invalid-box");
++        label = (GtkWidget*) gtk_builder_get_object (builder, "name-invalid-label");
++        gtk_widget_hide (warning);
++
++        if (name[0] == 0) {
++                return FALSE;
++        }
++
++        if (name[0] == '.') {
++                text = g_strdup_printf ("<small><i>%s</i></small>", _("Session names are not allowed\nto start with a '.' character"));
++                gtk_label_set_markup (GTK_LABEL (label), text);
++                gtk_widget_show (warning);
++                g_free (text);
++
++                return FALSE;
++        }
++
++        if (strchr (name, '/')) {
++                text = g_strdup_printf ("<small><i>%s</i></small>", _("Session names are not allowed\nto contain '/' characters"));
++                gtk_label_set_markup (GTK_LABEL (label), text);
++                gtk_widget_show (warning);
++                g_free (text);
++
++                return FALSE;
++        }
++
++        gtk_tree_model_get_iter_first (GTK_TREE_MODEL (store), &iter);
++        do {
++                gtk_tree_model_get (GTK_TREE_MODEL (store), &iter, 0, &n, -1);
++                if (strcmp (n, name) == 0) {
++                        text = g_strdup_printf ("<small><i>%s</i></small>", _("A session with this name\nalready exists"));
++                        gtk_label_set_markup (GTK_LABEL (label), text);
++                        gtk_widget_show (warning);
++                        g_free (text);
++
++                        g_free (n);
++                        return FALSE;
++                }
++                g_free (n);
++        } while (gtk_tree_model_iter_next (GTK_TREE_MODEL (store), &iter));
++
++        return TRUE;
++}
++
++static void
++populate_session_list (GtkWidget *session_list)
++{
++        GtkTreeIter iter;
++        char *path;
++        const char *name;
++        GDir *dir;
++        GError *error;
++        char *saved_session;
++        char *default_session;
++        char *default_name;
++        char last_session[PATH_MAX] = "";
++
++        saved_session = get_session_path ("saved-session");
++
++        if (!g_file_test (saved_session, G_FILE_TEST_IS_SYMLINK)) {
++                default_name = find_new_session_name ();
++                default_session = get_session_path (default_name);
++                rename (saved_session, default_session);
++                if (symlink (default_name, saved_session) < 0)
++                        g_warning ("Failed to convert saved-session to symlink");
++                g_free (default_name);
++                g_free (default_session);
++        }
++
++        path = g_build_filename (g_get_user_config_dir (), "gnome-session", NULL);
++        error = NULL;
++        dir = g_dir_open (path, 0, &error);
++        if (dir == NULL) {
++                g_warning ("Failed to open %s: %s", path, error->message);
++                g_error_free (error);
++                goto out;
++        }
++
++        default_name = NULL;
++        if (readlink (saved_session, last_session, PATH_MAX - 1) > 0) {
++                default_name = g_path_get_basename (last_session);
++        }
++
++        while ((name = g_dir_read_name (dir)) != NULL) {
++                if (strcmp (name, "saved-session") == 0)
++                        continue;
++
++                gtk_list_store_insert_with_values (store, &iter, 100, 0, name, -1);
++
++                if (g_strcmp0 (default_name, name) == 0) {
++                        GtkTreeSelection *selection;
++                        GtkTreeIter child_iter;
++
++                        gtk_tree_model_sort_convert_child_iter_to_iter (GTK_TREE_MODEL_SORT (sort_model), &child_iter, &iter);
++                        selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
++                        gtk_tree_selection_select_iter (selection, &child_iter);
++                }
++        }
++
++        g_free (default_name);
++        g_dir_close (dir);
++
++ out:
++        g_free (saved_session);
++        g_free (path);
++}
++
++static char *
++get_selected_session (void)
++{
++        GtkTreeSelection *selection;
++        GtkTreeModel *model;
++        GtkTreeIter iter;
++        gchar *name;
++
++        selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
++        if (gtk_tree_selection_get_selected (selection, &model, &iter)) {
++                gtk_tree_model_get (model, &iter, 0, &name, -1);
++                return name;
++        }
++
++        return NULL;
++}
++
++static void
++on_new_session_activated (GtkButton *button, gpointer data)
++{
++        GtkWidget *notebook;
++        GtkWidget *window;
++        GtkWidget *ok_button;
++        GtkWidget *entry;
++        gchar *name;
++
++        notebook = (GtkWidget*) gtk_builder_get_object (builder, "main-notebook");
++        window = (GtkWidget*) gtk_builder_get_object (builder, "main-window");
++        ok_button = (GtkWidget*) gtk_builder_get_object (builder, "name-ok-button");
++        entry = (GtkWidget*) gtk_builder_get_object (builder, "name-entry");
++
++        name = find_new_session_name ();
++        gtk_entry_set_text (GTK_ENTRY (entry), name);
++        g_free (name);
++
++        gtk_notebook_set_current_page (GTK_NOTEBOOK (notebook), 1);
++        gtk_widget_grab_default (ok_button);
++        gtk_widget_grab_focus (entry);
++}
++
++static void
++remove_session (const char *name)
++{
++        char *path1, *path2;
++        char *n, *path;
++        const char *d;
++        GDir *dir;
++        GError *error;
++
++        path1 = get_session_path ("saved-session");
++        path2 = get_session_path (name);
++
++        error = NULL;
++        n = g_file_read_link (path1, &error);
++        if (n == NULL) {
++                g_warning ("Failed to read link: %s", error->message);
++                g_error_free (error);
++        }
++        else if (strcmp (n, name) == 0) {
++                unlink (path1);
++        }
++        g_free (n);
++
++        dir = g_dir_open (path2, 0, NULL);
++        while ((d = g_dir_read_name (dir)) != NULL) {
++                path = g_build_filename (path2, d, NULL);
++                unlink (path);
++                g_free (path);
++        }
++        g_dir_close (dir);
++
++        remove (path2);
++
++        g_free (path1);
++        g_free (path2);
++}
++
++static void select_session (const char *name);
++
++static void
++on_remove_session_activated (GtkButton *button, gpointer data)
++{
++        GtkTreeSelection *selection;
++        GtkTreeModel *model;
++        GtkTreeIter iter;
++        char *name;
++
++        selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
++        if (gtk_tree_selection_get_selected (selection, &model, &iter)) {
++                GtkTreeIter child_iter;
++                gtk_tree_model_get (model, &iter, 0, &name, -1);
++                remove_session (name);
++                g_free (name);
++
++                gtk_tree_model_sort_convert_iter_to_child_iter (GTK_TREE_MODEL_SORT (model), &child_iter, &iter);
++                gtk_list_store_remove (GTK_LIST_STORE (store), &child_iter);
++
++                if (!gtk_tree_selection_get_selected (selection, NULL, NULL)) {
++                        gtk_tree_model_get_iter_first (model, &iter);
++                        gtk_tree_model_get (model, &iter, 0, &name, -1);
++                        select_session (name);
++                        g_free (name);
++                }
++        }
++}
++
++static void
++on_continue_activated (GtkButton *button, gpointer data)
++{
++        char *name;
++
++        name = get_selected_session ();
++        g_free (name);
++
++        gtk_main_quit ();
++}
++
++static void
++create_session (const char *name)
++{
++        char *path;
++        GtkTreeIter iter;
++
++        path = g_build_filename (g_get_user_config_dir (), "gnome-session", name, NULL);
++
++        if (mkdir (path, 0755) < 0) {
++                g_warning ("Failed to create directory %s", path);
++        }
++        else {
++                char *marker;
++
++                gtk_list_store_insert_with_values (store, &iter, 100, 0, name, -1);
++
++                marker = g_build_filename (path, ".new-session", NULL);
++                creat (marker, 0600);
++                g_free (marker);
++        }
++
++        g_free (path);
++}
++
++static gboolean
++make_session_current (const char *name)
++{
++        char *path1;
++        gboolean ret = TRUE;
++
++        path1 = g_build_filename (g_get_user_config_dir (), "gnome-session", "saved-session", NULL);
++
++        unlink (path1);
++        if (symlink (name, path1) < 0) {
++                g_warning ("Failed to make session '%s' current", name);
++                ret = FALSE;
++        }
++
++        g_free (path1);
++
++        return ret;
++}
++
++static gboolean
++create_and_select_session (const char *name)
++{
++        gchar *path;
++
++        if (name[0] == 0 || name[0] == '.' || strchr (name, '/')) {
++                g_warning ("Invalid session name");
++                return FALSE;
++        }
++
++        path = g_build_filename (g_get_user_config_dir (), "gnome-session", name, NULL);
++        if (!g_file_test (path, G_FILE_TEST_IS_DIR)) {
++                if (mkdir (path, 0755) < 0) {
++                        g_warning ("Failed to create directory %s", path);
++                        g_free (path);
++                        return FALSE;
++                }
++        }
++
++        g_free (path);
++
++        return make_session_current (name);
++}
++
++static void
++select_session (const char *name)
++{
++        GtkTreeSelection *selection;
++        GtkTreeIter iter;
++        gboolean found;
++        char *n;
++
++        make_session_current (name);
++
++        /* now select it in the list */
++        selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
++        gtk_tree_model_get_iter_first (GTK_TREE_MODEL (sort_model), &iter);
++        found = FALSE;
++        do {
++                gtk_tree_model_get (GTK_TREE_MODEL (sort_model), &iter, 0, &n, -1);
++                if (strcmp (n, name) == 0) {
++                        gtk_tree_selection_select_iter (selection, &iter);
++                        g_free (n);
++                        break;
++                }
++                g_free (n);
++        } while (gtk_tree_model_iter_next (GTK_TREE_MODEL (sort_model), &iter));
++}
++
++static void
++on_name_ok_button_activated (GtkButton *button, gpointer data)
++{
++        GtkWidget *notebook;
++        GtkWidget *entry;
++        const char *name;
++
++        notebook = (GtkWidget*) gtk_builder_get_object (builder, "main-notebook");
++        entry = (GtkWidget*) gtk_builder_get_object (builder, "name-entry");
++        name = gtk_entry_get_text (GTK_ENTRY (entry));
++
++        create_session (name);
++        select_session (name);
++
++        gtk_notebook_set_current_page (GTK_NOTEBOOK (notebook), 0);
++        gtk_widget_grab_focus (session_list);
++}
++
++static void
++on_name_cancel_button_activated (GtkButton *button, gpointer data)
++{
++        GtkWidget *notebook;
++
++        notebook = (GtkWidget*) gtk_builder_get_object (builder, "main-notebook");
++
++        gtk_notebook_set_current_page (GTK_NOTEBOOK (notebook), 0);
++        gtk_widget_grab_focus (session_list);
++}
++
++static void
++on_selection_changed (GtkTreeSelection *selection, gpointer data)
++{
++        char *name;
++
++        name = get_selected_session ();
++        make_session_current (name);
++
++        g_free (name);
++}
++
++static void
++update_remove_button (void)
++{
++        GtkWidget *button;
++
++        button = (GtkWidget *)gtk_builder_get_object (builder, "remove-session");
++        if (gtk_tree_model_iter_n_children (GTK_TREE_MODEL (store), NULL) > 1)
++                gtk_widget_set_sensitive (button, TRUE);
++        else
++                gtk_widget_set_sensitive (button, FALSE);
++}
++
++static void
++on_row_deleted (GtkTreeModel *model,
++                GtkTreePath  *path,
++                gpointer      data)
++{
++        update_remove_button ();
++}
++
++static void
++on_row_inserted (GtkTreeModel *model,
++                 GtkTreePath  *path,
++                 GtkTreeIter  *iter,
++                 gpointer      data)
++{
++        update_remove_button ();
++}
++
++static void
++on_row_activated (GtkTreeView       *tree_view,
++                  GtkTreePath       *path,
++                  GtkTreeViewColumn *column,
++                  gpointer           data)
++{
++        char *name;
++
++        name = get_selected_session ();
++        g_free (name);
++
++        gtk_main_quit ();
++}
++
++static void
++on_text_changed (GObject *entry, GParamSpec *pspec, gpointer data)
++{
++        GtkWidget *button;
++        const char *name;
++
++        name = gtk_entry_get_text (GTK_ENTRY (entry));
++
++        button = (GtkWidget *)gtk_builder_get_object (builder, "name-ok-button");
++        gtk_widget_set_sensitive (button, is_valid_session_name (name));
++}
++
++static void
++auto_save_next_session (void)
++{
++        GConfClient *client;
++        GError *error;
++
++        client = gconf_client_get_default ();
++
++        error = NULL;
++        if (!gconf_client_set_bool (client,
++                                    KEY_AUTOSAVE_ONE_SHOT,
++                                    TRUE,
++                                    &error)) {
++        }
++        g_object_unref (client);
++}
++
++static void
++auto_save_next_session_if_needed (void)
++{
++        char *marker;
++
++        marker = g_build_filename (g_get_user_config_dir (),
++                                   "gnome-session", "saved-session",
++                                   ".new-session", NULL);
++
++        if (g_file_test (marker, G_FILE_TEST_EXISTS)) {
++                auto_save_next_session ();
++                unlink (marker);
++        }
++        g_free (marker);
++}
++
++static int
++compare_sessions (GtkTreeModel *model,
++                  GtkTreeIter  *a,
++                  GtkTreeIter  *b,
++                  gpointer      data)
++{
++    char *name_a, *name_b;
++    int result;
++
++    gtk_tree_model_get (model, a, 0, &name_a, -1);
++    gtk_tree_model_get (model, b, 0, &name_b, -1);
++
++    result = g_utf8_collate (name_a, name_b);
++
++    g_free (name_a);
++    g_free (name_b);
++
++    return result;
++}
++
++int
++main (int argc, char *argv[])
++{
++        GtkWidget *window;
++        GtkWidget *widget;
++        GtkWidget *dialog;
++        GtkCellRenderer *cell;
++        GtkTreeViewColumn *column;
++        GtkTreeSelection *selection;
++        GError *error;
++
++        if (getenv ("SESSION_MANAGER") != NULL)
++            return 1;
++
++        gtk_init (&argc, &argv);
++        if (argc > 1) {
++                if (!create_and_select_session (argv[1]))
++                        return 1;
++                else
++                        return 0;
++        }
++
++        builder = gtk_builder_new ();
++        gtk_builder_set_translation_domain (builder, GETTEXT_PACKAGE);
++
++        error = NULL;
++        if (!gtk_builder_add_from_file (builder, GTKBUILDER_DIR "/" "session-selector.ui",  &error)) {
++                g_warning ("Could not load file 'session-selector.ui': %s", error->message);
++                exit (1);
++        }
++
++        window = (GtkWidget *) gtk_builder_get_object (builder, "main-window");
++
++        store = (GtkListStore *) gtk_builder_get_object (builder, "session-store");
++        sort_model = (GtkTreeModelSort *) gtk_builder_get_object (builder, "sort-model");
++
++        gtk_tree_sortable_set_sort_func (GTK_TREE_SORTABLE (sort_model),
++                                         0, compare_sessions, NULL, NULL);
++        gtk_tree_sortable_set_sort_column_id (GTK_TREE_SORTABLE (sort_model),
++                                              0, GTK_SORT_ASCENDING);
++        g_signal_connect (store, "row-deleted", G_CALLBACK (on_row_deleted), NULL);
++        g_signal_connect (store, "row-inserted", G_CALLBACK (on_row_inserted), NULL);
++        session_list = (GtkWidget *) gtk_builder_get_object (builder, "session-list");
++
++        selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
++        gtk_tree_selection_set_mode (selection, GTK_SELECTION_BROWSE);
++
++        populate_session_list (session_list);
++
++        cell = gtk_cell_renderer_text_new ();
++        column = gtk_tree_view_column_new_with_attributes ("", cell, "text", 0, NULL);
++        gtk_tree_view_append_column (GTK_TREE_VIEW (session_list), GTK_TREE_VIEW_COLUMN (column));
++
++        g_signal_connect (session_list, "row-activated", G_CALLBACK (on_row_activated), NULL);
++
++        g_signal_connect (selection, "changed",
++                          G_CALLBACK (on_selection_changed), NULL);
++
++        widget = (GtkWidget *)gtk_builder_get_object (builder, "name-entry");
++        g_signal_connect (widget, "notify::text", G_CALLBACK (on_text_changed), NULL);
++        dialog = (GtkWidget*) gtk_builder_get_object (builder, "name-dialog");
++
++        widget = (GtkWidget *) gtk_builder_get_object (builder, "name-ok-button");
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_name_ok_button_activated), NULL);
++
++        widget = (GtkWidget *) gtk_builder_get_object (builder, "name-cancel-button");
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_name_cancel_button_activated), NULL);
++        widget = (GtkWidget *) gtk_builder_get_object (builder, "new-session");
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_new_session_activated), NULL);
++        widget = (GtkWidget *) gtk_builder_get_object (builder, "remove-session");
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_remove_session_activated), NULL);
++        widget = (GtkWidget *) gtk_builder_get_object (builder, "continue-button");
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_continue_activated), NULL);
++
++
++        gtk_widget_show (window);
++
++        gtk_main ();
++
++        auto_save_next_session_if_needed ();
++
++        return 0;
++}
++
+-- 
+1.6.5.2
+
+
+From 5b738b7ff7d6ea9f4201cc8369f5c8a2a809c12e Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Fri, 18 Jun 2010 12:50:04 -0400
+Subject: [PATCH 4/9] clean up spacing a bit
+
+---
+ data/session-selector.ui |  449 +++++++++++++++++++++++-----------------------
+ 1 files changed, 227 insertions(+), 222 deletions(-)
+
+diff --git a/data/session-selector.ui b/data/session-selector.ui
+index 0d4ec57..a51a0ce 100644
+--- a/data/session-selector.ui
++++ b/data/session-selector.ui
+@@ -12,103 +12,139 @@
+     <property name="model">session-store</property>
+   </object>
+   <object class="GtkWindow" id="main-window">
+-    <property name="border_width">5</property>
+     <property name="title" translatable="yes">Custom Session</property>
+     <property name="window_position">center</property>
+     <property name="default_width">500</property>
+-    <property name="default_height">300</property>
++    <property name="default_height">310</property>
++    <property name="decorated">False</property>
+     <child>
+-      <object class="GtkNotebook" id="main-notebook">
++      <object class="GtkFrame" id="frame1">
+         <property name="visible">True</property>
+-        <property name="show_tabs">False</property>
++        <property name="label_xalign">0.5</property>
++        <property name="shadow_type">out</property>
+         <child>
+-          <object class="GtkVBox" id="vbox3">
++          <object class="GtkAlignment" id="alignment3">
+             <property name="visible">True</property>
+-            <property name="border_width">5</property>
+-            <property name="orientation">vertical</property>
+-            <property name="spacing">12</property>
++            <property name="border_width">6</property>
+             <child>
+-              <object class="GtkVBox" id="vbox4">
++              <object class="GtkNotebook" id="main-notebook">
+                 <property name="visible">True</property>
+-                <property name="orientation">vertical</property>
+-                <property name="spacing">12</property>
++                <property name="border_width">6</property>
++                <property name="show_tabs">False</property>
++                <property name="show_border">False</property>
+                 <child>
+-                  <object class="GtkLabel" id="label4">
+-                    <property name="visible">True</property>
+-                    <property name="label" translatable="yes">Please choose a custom session to run.</property>
+-                  </object>
+-                  <packing>
+-                    <property name="expand">False</property>
+-                    <property name="position">0</property>
+-                  </packing>
+-                </child>
+-                <child>
+-                  <object class="GtkHBox" id="hbox3">
++                  <object class="GtkVBox" id="vbox3">
+                     <property name="visible">True</property>
++                    <property name="orientation">vertical</property>
+                     <property name="spacing">12</property>
+                     <child>
+-                      <object class="GtkScrolledWindow" id="scrolledwindow2">
+-                        <property name="visible">True</property>
+-                        <property name="can_focus">True</property>
+-                        <property name="hscrollbar_policy">never</property>
+-                        <property name="vscrollbar_policy">automatic</property>
+-                        <property name="shadow_type">in</property>
+-                        <child>
+-                          <object class="GtkTreeView" id="session-list">
+-                            <property name="visible">True</property>
+-                            <property name="can_focus">True</property>
+-                            <property name="model">sort-model</property>
+-                            <property name="headers_visible">False</property>
+-                            <property name="search_column">0</property>
+-                          </object>
+-                        </child>
+-                      </object>
+-                      <packing>
+-                        <property name="position">0</property>
+-                      </packing>
+-                    </child>
+-                    <child>
+-                      <object class="GtkVButtonBox" id="vbuttonbox2">
++                      <object class="GtkVBox" id="vbox4">
+                         <property name="visible">True</property>
+                         <property name="orientation">vertical</property>
+-                        <property name="spacing">6</property>
+-                        <property name="layout_style">start</property>
++                        <property name="spacing">12</property>
+                         <child>
+-                          <object class="GtkButton" id="new-session">
+-                            <property name="label" translatable="yes">_New Session</property>
++                          <object class="GtkLabel" id="label4">
+                             <property name="visible">True</property>
+-                            <property name="can_focus">True</property>
+-                            <property name="receives_default">True</property>
+-                            <property name="use_underline">True</property>
++                            <property name="label" translatable="yes">Please choose a custom session to run</property>
+                           </object>
+                           <packing>
+                             <property name="expand">False</property>
+-                            <property name="fill">False</property>
+                             <property name="position">0</property>
+                           </packing>
+                         </child>
+                         <child>
+-                          <object class="GtkButton" id="remove-session">
+-                            <property name="label" translatable="yes">_Remove Session</property>
++                          <object class="GtkHBox" id="hbox3">
+                             <property name="visible">True</property>
+-                            <property name="can_focus">True</property>
+-                            <property name="receives_default">True</property>
+-                            <property name="use_underline">True</property>
++                            <property name="spacing">12</property>
++                            <child>
++                              <object class="GtkScrolledWindow" id="scrolledwindow2">
++                                <property name="visible">True</property>
++                                <property name="can_focus">True</property>
++                                <property name="hscrollbar_policy">never</property>
++                                <property name="vscrollbar_policy">automatic</property>
++                                <property name="shadow_type">in</property>
++                                <child>
++                                  <object class="GtkTreeView" id="session-list">
++                                    <property name="visible">True</property>
++                                    <property name="can_focus">True</property>
++                                    <property name="headers_visible">False</property>
++                                    <property name="search_column">0</property>
++                                  </object>
++                                </child>
++                              </object>
++                              <packing>
++                                <property name="position">0</property>
++                              </packing>
++                            </child>
++                            <child>
++                              <object class="GtkVButtonBox" id="vbuttonbox2">
++                                <property name="visible">True</property>
++                                <property name="orientation">vertical</property>
++                                <property name="spacing">6</property>
++                                <property name="layout_style">start</property>
++                                <child>
++                                  <object class="GtkButton" id="new-session">
++                                    <property name="label" translatable="yes">_New Session</property>
++                                    <property name="visible">True</property>
++                                    <property name="can_focus">True</property>
++                                    <property name="receives_default">True</property>
++                                    <property name="use_underline">True</property>
++                                  </object>
++                                  <packing>
++                                    <property name="expand">False</property>
++                                    <property name="fill">False</property>
++                                    <property name="position">0</property>
++                                  </packing>
++                                </child>
++                                <child>
++                                  <object class="GtkButton" id="remove-session">
++                                    <property name="label" translatable="yes">_Remove Session</property>
++                                    <property name="visible">True</property>
++                                    <property name="can_focus">True</property>
++                                    <property name="receives_default">True</property>
++                                    <property name="use_underline">True</property>
++                                  </object>
++                                  <packing>
++                                    <property name="expand">False</property>
++                                    <property name="fill">False</property>
++                                    <property name="position">1</property>
++                                  </packing>
++                                </child>
++                              </object>
++                              <packing>
++                                <property name="expand">False</property>
++                                <property name="position">1</property>
++                              </packing>
++                            </child>
+                           </object>
+                           <packing>
+-                            <property name="expand">False</property>
+-                            <property name="fill">False</property>
+                             <property name="position">1</property>
+                           </packing>
+                         </child>
++                      </object>
++                      <packing>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                    <child>
++                      <object class="GtkHButtonBox" id="hbuttonbox2">
++                        <property name="visible">True</property>
++                        <property name="spacing">6</property>
++                        <property name="layout_style">end</property>
+                         <child>
+-                          <object class="GtkLabel" id="label1">
++                          <object class="GtkButton" id="continue-button">
++                            <property name="label" translatable="yes">_Continue</property>
+                             <property name="visible">True</property>
++                            <property name="can_focus">True</property>
++                            <property name="can_default">True</property>
++                            <property name="has_default">True</property>
++                            <property name="receives_default">True</property>
++                            <property name="use_underline">True</property>
+                           </object>
+                           <packing>
+                             <property name="expand">False</property>
+                             <property name="fill">False</property>
+-                            <property name="position">2</property>
++                            <property name="position">0</property>
+                           </packing>
+                         </child>
+                       </object>
+@@ -118,221 +154,190 @@
+                       </packing>
+                     </child>
+                   </object>
+-                  <packing>
+-                    <property name="position">1</property>
+-                  </packing>
+                 </child>
+-              </object>
+-              <packing>
+-                <property name="position">0</property>
+-              </packing>
+-            </child>
+-            <child>
+-              <object class="GtkHButtonBox" id="hbuttonbox2">
+-                <property name="visible">True</property>
+-                <property name="spacing">6</property>
+-                <property name="layout_style">end</property>
+-                <child>
+-                  <object class="GtkButton" id="continue-button">
+-                    <property name="label" translatable="yes">_Continue</property>
+-                    <property name="visible">True</property>
+-                    <property name="can_focus">True</property>
+-                    <property name="can_default">True</property>
+-                    <property name="has_default">True</property>
+-                    <property name="receives_default">True</property>
+-                    <property name="use_underline">True</property>
+-                  </object>
+-                  <packing>
+-                    <property name="expand">False</property>
+-                    <property name="fill">False</property>
+-                    <property name="position">0</property>
+-                  </packing>
++                <child type="tab">
++                  <placeholder/>
+                 </child>
+-              </object>
+-              <packing>
+-                <property name="expand">False</property>
+-                <property name="position">1</property>
+-              </packing>
+-            </child>
+-          </object>
+-        </child>
+-        <child type="tab">
+-          <placeholder/>
+-        </child>
+-        <child>
+-          <object class="GtkVBox" id="vbox5">
+-            <property name="visible">True</property>
+-            <property name="border_width">5</property>
+-            <property name="orientation">vertical</property>
+-            <property name="spacing">2</property>
+-            <child>
+-              <object class="GtkVBox" id="vbox1">
+-                <property name="visible">True</property>
+-                <property name="orientation">vertical</property>
+-                <property name="spacing">12</property>
+                 <child>
+-                  <object class="GtkLabel" id="label2">
++                  <object class="GtkVBox" id="vbox5">
+                     <property name="visible">True</property>
+-                    <property name="label" translatable="yes">Please enter a name for the new session.</property>
+-                  </object>
+-                  <packing>
+-                    <property name="expand">False</property>
+-                    <property name="position">0</property>
+-                  </packing>
+-                </child>
+-                <child>
+-                  <object class="GtkAlignment" id="alignment1">
+-                    <property name="visible">True</property>
+-                    <property name="xalign">0</property>
+-                    <property name="yalign">0</property>
+-                    <property name="yscale">0</property>
++                    <property name="border_width">5</property>
++                    <property name="orientation">vertical</property>
++                    <property name="spacing">2</property>
+                     <child>
+-                      <object class="GtkTable" id="table1">
++                      <object class="GtkVBox" id="vbox1">
+                         <property name="visible">True</property>
+-                        <property name="n_rows">2</property>
+-                        <property name="n_columns">2</property>
+-                        <property name="column_spacing">6</property>
+-                        <property name="row_spacing">6</property>
++                        <property name="orientation">vertical</property>
++                        <property name="spacing">12</property>
+                         <child>
+-                          <object class="GtkLabel" id="label5">
++                          <object class="GtkLabel" id="label2">
+                             <property name="visible">True</property>
+-                            <property name="xalign">1</property>
+-                            <property name="label" translatable="yes">_Name:</property>
+-                            <property name="use_underline">True</property>
+-                            <property name="mnemonic_widget">name-entry</property>
++                            <property name="label" translatable="yes">Please enter a name for the new session.</property>
+                           </object>
+                           <packing>
+-                            <property name="x_options">GTK_FILL</property>
+-                          </packing>
+-                        </child>
+-                        <child>
+-                          <object class="GtkEntry" id="name-entry">
+-                            <property name="visible">True</property>
+-                            <property name="can_focus">True</property>
+-                            <property name="invisible_char">&#x25CF;</property>
+-                            <property name="activates_default">True</property>
+-                          </object>
+-                          <packing>
+-                            <property name="left_attach">1</property>
+-                            <property name="right_attach">2</property>
++                            <property name="expand">False</property>
++                            <property name="position">0</property>
+                           </packing>
+                         </child>
+                         <child>
+-                          <object class="GtkLabel" id="label3">
++                          <object class="GtkAlignment" id="alignment1">
+                             <property name="visible">True</property>
+-                            <property name="label">
++                            <property name="xalign">0</property>
++                            <property name="yalign">0</property>
++                            <property name="yscale">0</property>
++                            <child>
++                              <object class="GtkTable" id="table1">
++                                <property name="visible">True</property>
++                                <property name="n_rows">2</property>
++                                <property name="n_columns">2</property>
++                                <property name="column_spacing">6</property>
++                                <property name="row_spacing">6</property>
++                                <child>
++                                  <object class="GtkLabel" id="label5">
++                                    <property name="visible">True</property>
++                                    <property name="xalign">1</property>
++                                    <property name="label" translatable="yes">_Name:</property>
++                                    <property name="use_underline">True</property>
++                                  </object>
++                                  <packing>
++                                    <property name="x_options">GTK_FILL</property>
++                                  </packing>
++                                </child>
++                                <child>
++                                  <object class="GtkEntry" id="name-entry">
++                                    <property name="visible">True</property>
++                                    <property name="can_focus">True</property>
++                                    <property name="invisible_char">&#x25CF;</property>
++                                    <property name="activates_default">True</property>
++                                  </object>
++                                  <packing>
++                                    <property name="left_attach">1</property>
++                                    <property name="right_attach">2</property>
++                                  </packing>
++                                </child>
++                                <child>
++                                  <object class="GtkLabel" id="label3">
++                                    <property name="visible">True</property>
++                                    <property name="label">
+ </property>
++                                  </object>
++                                  <packing>
++                                    <property name="top_attach">1</property>
++                                    <property name="bottom_attach">2</property>
++                                    <property name="x_options">GTK_FILL</property>
++                                  </packing>
++                                </child>
++                                <child>
++                                  <object class="GtkHBox" id="name-invalid-box">
++                                    <property name="visible">True</property>
++                                    <property name="spacing">6</property>
++                                    <child>
++                                      <object class="GtkImage" id="image1">
++                                        <property name="visible">True</property>
++                                        <property name="stock">gtk-dialog-error</property>
++                                      </object>
++                                      <packing>
++                                        <property name="expand">False</property>
++                                        <property name="position">0</property>
++                                      </packing>
++                                    </child>
++                                    <child>
++                                      <object class="GtkAlignment" id="alignment2">
++                                        <property name="visible">True</property>
++                                        <property name="yscale">0</property>
++                                        <child>
++                                          <object class="GtkLabel" id="name-invalid-label">
++                                            <property name="visible">True</property>
++                                            <property name="xalign">0</property>
++                                            <property name="yalign">1</property>
++                                            <property name="use_markup">True</property>
++                                          </object>
++                                        </child>
++                                      </object>
++                                      <packing>
++                                        <property name="position">1</property>
++                                      </packing>
++                                    </child>
++                                  </object>
++                                  <packing>
++                                    <property name="left_attach">1</property>
++                                    <property name="right_attach">2</property>
++                                    <property name="top_attach">1</property>
++                                    <property name="bottom_attach">2</property>
++                                  </packing>
++                                </child>
++                              </object>
++                            </child>
+                           </object>
+                           <packing>
+-                            <property name="top_attach">1</property>
+-                            <property name="bottom_attach">2</property>
+-                            <property name="x_options">GTK_FILL</property>
++                            <property name="position">1</property>
+                           </packing>
+                         </child>
+                         <child>
+-                          <object class="GtkHBox" id="name-invalid-box">
++                          <object class="GtkHButtonBox" id="hbuttonbox3">
+                             <property name="visible">True</property>
+                             <property name="spacing">6</property>
++                            <property name="layout_style">end</property>
+                             <child>
+-                              <object class="GtkImage" id="image1">
++                              <object class="GtkButton" id="name-cancel-button">
++                                <property name="label">gtk-cancel</property>
+                                 <property name="visible">True</property>
+-                                <property name="stock">gtk-dialog-error</property>
++                                <property name="can_focus">True</property>
++                                <property name="receives_default">True</property>
++                                <property name="use_stock">True</property>
+                               </object>
+                               <packing>
+                                 <property name="expand">False</property>
++                                <property name="fill">False</property>
+                                 <property name="position">0</property>
+                               </packing>
+                             </child>
+                             <child>
+-                              <object class="GtkAlignment" id="alignment2">
++                              <object class="GtkButton" id="name-ok-button">
++                                <property name="label">gtk-ok</property>
+                                 <property name="visible">True</property>
+-                                <property name="yscale">0</property>
+-                                <child>
+-                                  <object class="GtkLabel" id="name-invalid-label">
+-                                    <property name="visible">True</property>
+-                                    <property name="xalign">0</property>
+-                                    <property name="yalign">1</property>
+-                                    <property name="use_markup">True</property>
+-                                  </object>
+-                                </child>
++                                <property name="can_focus">True</property>
++                                <property name="can_default">True</property>
++                                <property name="has_default">True</property>
++                                <property name="receives_default">True</property>
++                                <property name="use_stock">True</property>
+                               </object>
+                               <packing>
++                                <property name="expand">False</property>
++                                <property name="fill">False</property>
+                                 <property name="position">1</property>
+                               </packing>
+                             </child>
+                           </object>
+                           <packing>
+-                            <property name="left_attach">1</property>
+-                            <property name="right_attach">2</property>
+-                            <property name="top_attach">1</property>
+-                            <property name="bottom_attach">2</property>
++                            <property name="expand">False</property>
++                            <property name="position">2</property>
+                           </packing>
+                         </child>
+                       </object>
+-                    </child>
+-                  </object>
+-                  <packing>
+-                    <property name="position">1</property>
+-                  </packing>
+-                </child>
+-                <child>
+-                  <object class="GtkHButtonBox" id="hbuttonbox3">
+-                    <property name="visible">True</property>
+-                    <property name="spacing">6</property>
+-                    <property name="layout_style">end</property>
+-                    <child>
+-                      <object class="GtkButton" id="name-cancel-button">
+-                        <property name="label">gtk-cancel</property>
+-                        <property name="visible">True</property>
+-                        <property name="can_focus">True</property>
+-                        <property name="receives_default">True</property>
+-                        <property name="use_stock">True</property>
+-                      </object>
+                       <packing>
+-                        <property name="expand">False</property>
+-                        <property name="fill">False</property>
+                         <property name="position">0</property>
+                       </packing>
+                     </child>
+-                    <child>
+-                      <object class="GtkButton" id="name-ok-button">
+-                        <property name="label">gtk-ok</property>
+-                        <property name="visible">True</property>
+-                        <property name="can_focus">True</property>
+-                        <property name="can_default">True</property>
+-                        <property name="has_default">True</property>
+-                        <property name="receives_default">True</property>
+-                        <property name="use_stock">True</property>
+-                      </object>
+-                      <packing>
+-                        <property name="expand">False</property>
+-                        <property name="fill">False</property>
+-                        <property name="position">1</property>
+-                      </packing>
+-                    </child>
+                   </object>
+                   <packing>
+-                    <property name="expand">False</property>
+-                    <property name="position">2</property>
++                    <property name="position">1</property>
+                   </packing>
+                 </child>
++                <child type="tab">
++                  <placeholder/>
++                </child>
++                <child>
++                  <placeholder/>
++                </child>
++                <child type="tab">
++                  <placeholder/>
++                </child>
+               </object>
+-              <packing>
+-                <property name="position">0</property>
+-              </packing>
+             </child>
+           </object>
+-          <packing>
+-            <property name="position">1</property>
+-          </packing>
+-        </child>
+-        <child type="tab">
+-          <placeholder/>
+-        </child>
+-        <child>
+-          <placeholder/>
+         </child>
+-        <child type="tab">
++        <child type="label_item">
+           <placeholder/>
+         </child>
+       </object>
+-- 
+1.6.5.2
+
+
+From 01fae24fb6de7b500e0e9d3088a3a6d06021c045 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Fri, 18 Jun 2010 13:03:22 -0400
+Subject: [PATCH 5/9] use SINGLE instead of BROWSE mode for list
+
+---
+ tools/gnome-session-selector.c |    3 +--
+ 1 files changed, 1 insertions(+), 2 deletions(-)
+
+diff --git a/tools/gnome-session-selector.c b/tools/gnome-session-selector.c
+index fb715eb..2bcbe76 100644
+--- a/tools/gnome-session-selector.c
++++ b/tools/gnome-session-selector.c
+@@ -587,7 +587,7 @@ main (int argc, char *argv[])
+         session_list = (GtkWidget *) gtk_builder_get_object (builder, "session-list");
+ 
+         selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
+-        gtk_tree_selection_set_mode (selection, GTK_SELECTION_BROWSE);
++        gtk_tree_selection_set_mode (selection, GTK_SELECTION_SINGLE);
+ 
+         populate_session_list (session_list);
+ 
+@@ -616,7 +616,6 @@ main (int argc, char *argv[])
+         widget = (GtkWidget *) gtk_builder_get_object (builder, "continue-button");
+         g_signal_connect (widget, "clicked", G_CALLBACK (on_continue_activated), NULL);
+ 
+-
+         gtk_widget_show (window);
+ 
+         gtk_main ();
+-- 
+1.6.5.2
+
+
+From da0fad467b6159aa3bd55faa750227d7057ab712 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Fri, 18 Jun 2010 15:25:37 -0400
+Subject: [PATCH 6/9] Add rename support to session selector
+
+This commit makes the session selector dialog support renaming sessions.
+---
+ data/session-selector.ui       |  118 +++++-----------------
+ tools/gnome-session-selector.c |  213 +++++++++++++++++++++++++---------------
+ 2 files changed, 160 insertions(+), 171 deletions(-)
+
+diff --git a/data/session-selector.ui b/data/session-selector.ui
+index a51a0ce..77dc9b8 100644
+--- a/data/session-selector.ui
++++ b/data/session-selector.ui
+@@ -27,11 +27,11 @@
+             <property name="visible">True</property>
+             <property name="border_width">6</property>
+             <child>
+-              <object class="GtkNotebook" id="main-notebook">
++              <object class="GtkVBox" id="vbox3">
+                 <property name="visible">True</property>
+-                <property name="border_width">6</property>
+-                <property name="show_tabs">False</property>
+-                <property name="show_border">False</property>
++                <property name="orientation">vertical</property>
++                <property name="spacing">6</property>
++
+                 <child>
+                   <object class="GtkVBox" id="vbox3">
+                     <property name="visible">True</property>
+@@ -45,7 +45,8 @@
+                         <child>
+                           <object class="GtkLabel" id="label4">
+                             <property name="visible">True</property>
+-                            <property name="label" translatable="yes">Please choose a custom session to run</property>
++                            <property name="xalign">0</property>
++                            <property name="label" translatable="yes">Please choose a custom session to run:</property>
+                           </object>
+                           <packing>
+                             <property name="expand">False</property>
+@@ -69,6 +70,7 @@
+                                     <property name="can_focus">True</property>
+                                     <property name="headers_visible">False</property>
+                                     <property name="search_column">0</property>
++                                    <property name="model">sort-model</property>
+                                   </object>
+                                 </child>
+                               </object>
+@@ -110,6 +112,20 @@
+                                     <property name="position">1</property>
+                                   </packing>
+                                 </child>
++                                <child>
++                                  <object class="GtkButton" id="rename-session">
++                                    <property name="label" translatable="yes">Rena_me Session</property>
++                                    <property name="visible">True</property>
++                                    <property name="can_focus">True</property>
++                                    <property name="receives_default">True</property>
++                                    <property name="use_underline">True</property>
++                                  </object>
++                                  <packing>
++                                    <property name="expand">False</property>
++                                    <property name="fill">False</property>
++                                    <property name="position">2</property>
++                                  </packing>
++                                </child>
+                               </object>
+                               <packing>
+                                 <property name="expand">False</property>
+@@ -188,84 +204,10 @@
+                             <child>
+                               <object class="GtkTable" id="table1">
+                                 <property name="visible">True</property>
+-                                <property name="n_rows">2</property>
+-                                <property name="n_columns">2</property>
+-                                <property name="column_spacing">6</property>
+-                                <property name="row_spacing">6</property>
+-                                <child>
+-                                  <object class="GtkLabel" id="label5">
+-                                    <property name="visible">True</property>
+-                                    <property name="xalign">1</property>
+-                                    <property name="label" translatable="yes">_Name:</property>
+-                                    <property name="use_underline">True</property>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="x_options">GTK_FILL</property>
+-                                  </packing>
+-                                </child>
+-                                <child>
+-                                  <object class="GtkEntry" id="name-entry">
+-                                    <property name="visible">True</property>
+-                                    <property name="can_focus">True</property>
+-                                    <property name="invisible_char">&#x25CF;</property>
+-                                    <property name="activates_default">True</property>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="left_attach">1</property>
+-                                    <property name="right_attach">2</property>
+-                                  </packing>
+-                                </child>
+-                                <child>
+-                                  <object class="GtkLabel" id="label3">
+-                                    <property name="visible">True</property>
+-                                    <property name="label">
+-</property>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="top_attach">1</property>
+-                                    <property name="bottom_attach">2</property>
+-                                    <property name="x_options">GTK_FILL</property>
+-                                  </packing>
+-                                </child>
+-                                <child>
+-                                  <object class="GtkHBox" id="name-invalid-box">
+-                                    <property name="visible">True</property>
+-                                    <property name="spacing">6</property>
+-                                    <child>
+-                                      <object class="GtkImage" id="image1">
+-                                        <property name="visible">True</property>
+-                                        <property name="stock">gtk-dialog-error</property>
+-                                      </object>
+-                                      <packing>
+-                                        <property name="expand">False</property>
+-                                        <property name="position">0</property>
+-                                      </packing>
+-                                    </child>
+-                                    <child>
+-                                      <object class="GtkAlignment" id="alignment2">
+-                                        <property name="visible">True</property>
+-                                        <property name="yscale">0</property>
+-                                        <child>
+-                                          <object class="GtkLabel" id="name-invalid-label">
+-                                            <property name="visible">True</property>
+-                                            <property name="xalign">0</property>
+-                                            <property name="yalign">1</property>
+-                                            <property name="use_markup">True</property>
+-                                          </object>
+-                                        </child>
+-                                      </object>
+-                                      <packing>
+-                                        <property name="position">1</property>
+-                                      </packing>
+-                                    </child>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="left_attach">1</property>
+-                                    <property name="right_attach">2</property>
+-                                    <property name="top_attach">1</property>
+-                                    <property name="bottom_attach">2</property>
+-                                  </packing>
+-                                </child>
++                                <property name="can_focus">True</property>
++                                <property name="headers_visible">False</property>
++                                <property name="search_column">0</property>
++                                <property name="model">sort-model</property>
+                               </object>
+                             </child>
+                           </object>
+@@ -279,8 +221,8 @@
+                             <property name="spacing">6</property>
+                             <property name="layout_style">end</property>
+                             <child>
+-                              <object class="GtkButton" id="name-cancel-button">
+-                                <property name="label">gtk-cancel</property>
++                              <object class="GtkButton" id="new-session">
++                                <property name="label" translatable="yes">_New Session</property>
+                                 <property name="visible">True</property>
+                                 <property name="can_focus">True</property>
+                                 <property name="receives_default">True</property>
+@@ -327,12 +269,6 @@
+                 <child type="tab">
+                   <placeholder/>
+                 </child>
+-                <child>
+-                  <placeholder/>
+-                </child>
+-                <child type="tab">
+-                  <placeholder/>
+-                </child>
+               </object>
+             </child>
+           </object>
+diff --git a/tools/gnome-session-selector.c b/tools/gnome-session-selector.c
+index 2bcbe76..96fb274 100644
+--- a/tools/gnome-session-selector.c
++++ b/tools/gnome-session-selector.c
+@@ -33,6 +33,7 @@
+ #include <gconf/gconf-client.h>
+ 
+ #include <glib/gi18n.h>
++#include <glib/gstdio.h>
+ 
+ #define KEY_GNOME_SESSION_DIR     "/apps/gnome-session/options"
+ #define KEY_AUTOSAVE_ONE_SHOT     KEY_GNOME_SESSION_DIR "/auto_save_session_one_shot"
+@@ -42,6 +43,8 @@ static GtkWidget *session_list;
+ static GtkListStore *store;
+ static GtkTreeModelSort *sort_model;
+ 
++static void select_session (const char *name);
++
+ static char *
+ get_session_path (const char *name)
+ {
+@@ -203,29 +206,6 @@ get_selected_session (void)
+ }
+ 
+ static void
+-on_new_session_activated (GtkButton *button, gpointer data)
+-{
+-        GtkWidget *notebook;
+-        GtkWidget *window;
+-        GtkWidget *ok_button;
+-        GtkWidget *entry;
+-        gchar *name;
+-
+-        notebook = (GtkWidget*) gtk_builder_get_object (builder, "main-notebook");
+-        window = (GtkWidget*) gtk_builder_get_object (builder, "main-window");
+-        ok_button = (GtkWidget*) gtk_builder_get_object (builder, "name-ok-button");
+-        entry = (GtkWidget*) gtk_builder_get_object (builder, "name-entry");
+-
+-        name = find_new_session_name ();
+-        gtk_entry_set_text (GTK_ENTRY (entry), name);
+-        g_free (name);
+-
+-        gtk_notebook_set_current_page (GTK_NOTEBOOK (notebook), 1);
+-        gtk_widget_grab_default (ok_button);
+-        gtk_widget_grab_focus (entry);
+-}
+-
+-static void
+ remove_session (const char *name)
+ {
+         char *path1, *path2;
+@@ -262,10 +242,9 @@ remove_session (const char *name)
+         g_free (path2);
+ }
+ 
+-static void select_session (const char *name);
+-
+ static void
+-on_remove_session_activated (GtkButton *button, gpointer data)
++on_remove_session_clicked (GtkButton *button,
++                           gpointer   data)
+ {
+         GtkTreeSelection *selection;
+         GtkTreeModel *model;
+@@ -292,7 +271,42 @@ on_remove_session_activated (GtkButton *button, gpointer data)
+ }
+ 
+ static void
+-on_continue_activated (GtkButton *button, gpointer data)
++begin_rename (void)
++{
++        GtkTreePath *path;
++        GtkTreeViewColumn *column;
++        GList *cells;
++
++        gtk_widget_grab_focus (session_list);
++
++        gtk_tree_view_get_cursor (GTK_TREE_VIEW (session_list),
++                                  &path, &column);
++
++        cells = gtk_cell_layout_get_cells (GTK_CELL_LAYOUT (column));
++
++        if (cells != NULL) {
++            GtkCellRenderer *cell;
++
++            cell = (GtkCellRenderer *) cells->data;
++            g_list_free (cells);
++
++            g_object_set (cell, "editable", TRUE, NULL);
++            gtk_tree_view_set_cursor_on_cell (GTK_TREE_VIEW (session_list), path,
++                                              column, cell, TRUE);
++        }
++        gtk_tree_path_free (path);
++}
++
++static void
++on_rename_session_clicked (GtkButton *button,
++                           gpointer   data)
++{
++    begin_rename ();
++}
++
++static void
++on_continue_clicked (GtkButton *button,
++                     gpointer    data)
+ {
+         char *name;
+ 
+@@ -308,7 +322,7 @@ create_session (const char *name)
+         char *path;
+         GtkTreeIter iter;
+ 
+-        path = g_build_filename (g_get_user_config_dir (), "gnome-session", name, NULL);
++        path = get_session_path (name);
+ 
+         if (mkdir (path, 0755) < 0) {
+                 g_warning ("Failed to create directory %s", path);
+@@ -327,6 +341,36 @@ create_session (const char *name)
+ }
+ 
+ static gboolean
++rename_session (const char *old_name,
++                const char *new_name)
++{
++        char *old_path, *new_path;
++        int result;
++
++        if (g_strcmp0 (old_name, new_name) == 0) {
++                return TRUE;
++        }
++
++        if (!is_valid_session_name (new_name)) {
++               return FALSE;
++        }
++
++        old_path = get_session_path (old_name);
++        new_path = get_session_path (new_name);
++
++        result = g_rename (old_path, new_path);
++
++        if (result < 0) {
++                g_warning ("Failed to rename session from '%s' to '%s': %m", old_name, new_name);
++        }
++
++        g_free (old_path);
++        g_free (new_path);
++
++        return result == 0;
++}
++
++static gboolean
+ make_session_current (const char *name)
+ {
+         char *path1;
+@@ -372,7 +416,6 @@ create_and_select_session (const char *name)
+ static void
+ select_session (const char *name)
+ {
+-        GtkTreeSelection *selection;
+         GtkTreeIter iter;
+         gboolean found;
+         char *n;
+@@ -380,13 +423,16 @@ select_session (const char *name)
+         make_session_current (name);
+ 
+         /* now select it in the list */
+-        selection = gtk_tree_view_get_selection (GTK_TREE_VIEW (session_list));
+         gtk_tree_model_get_iter_first (GTK_TREE_MODEL (sort_model), &iter);
+         found = FALSE;
+         do {
+                 gtk_tree_model_get (GTK_TREE_MODEL (sort_model), &iter, 0, &n, -1);
+                 if (strcmp (n, name) == 0) {
+-                        gtk_tree_selection_select_iter (selection, &iter);
++                        GtkTreePath *path;
++
++                        path = gtk_tree_model_get_path (GTK_TREE_MODEL (sort_model), &iter);
++                        gtk_tree_view_set_cursor (GTK_TREE_VIEW (session_list), path, NULL, FALSE);
++                        gtk_tree_path_free (path);
+                         g_free (n);
+                         break;
+                 }
+@@ -395,40 +441,30 @@ select_session (const char *name)
+ }
+ 
+ static void
+-on_name_ok_button_activated (GtkButton *button, gpointer data)
++on_new_session_clicked (GtkButton *button,
++                        gpointer   data)
+ {
+-        GtkWidget *notebook;
+-        GtkWidget *entry;
+-        const char *name;
+-
+-        notebook = (GtkWidget*) gtk_builder_get_object (builder, "main-notebook");
+-        entry = (GtkWidget*) gtk_builder_get_object (builder, "name-entry");
+-        name = gtk_entry_get_text (GTK_ENTRY (entry));
++        gchar *name;
+ 
++        name = find_new_session_name ();
+         create_session (name);
+         select_session (name);
+ 
+-        gtk_notebook_set_current_page (GTK_NOTEBOOK (notebook), 0);
+-        gtk_widget_grab_focus (session_list);
++        begin_rename ();
+ }
+ 
+ static void
+-on_name_cancel_button_activated (GtkButton *button, gpointer data)
+-{
+-        GtkWidget *notebook;
+-
+-        notebook = (GtkWidget*) gtk_builder_get_object (builder, "main-notebook");
+-
+-        gtk_notebook_set_current_page (GTK_NOTEBOOK (notebook), 0);
+-        gtk_widget_grab_focus (session_list);
+-}
+-
+-static void
+-on_selection_changed (GtkTreeSelection *selection, gpointer data)
++on_selection_changed (GtkTreeSelection *selection,
++                      gpointer          data)
+ {
+         char *name;
+ 
+         name = get_selected_session ();
++
++        if (name == NULL) {
++                return;
++        }
++
+         make_session_current (name);
+ 
+         g_free (name);
+@@ -440,10 +476,44 @@ update_remove_button (void)
+         GtkWidget *button;
+ 
+         button = (GtkWidget *)gtk_builder_get_object (builder, "remove-session");
+-        if (gtk_tree_model_iter_n_children (GTK_TREE_MODEL (store), NULL) > 1)
++        if (gtk_tree_model_iter_n_children (GTK_TREE_MODEL (store), NULL) > 1) {
+                 gtk_widget_set_sensitive (button, TRUE);
+-        else
++        } else {
+                 gtk_widget_set_sensitive (button, FALSE);
++        }
++}
++
++static void
++on_row_edited (GtkCellRendererText *cell,
++               const char          *path_string,
++               const char          *new_name,
++               gpointer             data)
++{
++        GtkTreePath *path;
++        GtkTreeIter  sort_iter, items_iter;
++        char        *old_name;
++        gboolean     was_renamed;
++
++        path = gtk_tree_path_new_from_string (path_string);
++        gtk_tree_model_get_iter (GTK_TREE_MODEL (sort_model), &sort_iter, path);
++
++        gtk_tree_model_get (GTK_TREE_MODEL (sort_model), &sort_iter, 0, &old_name, -1);
++
++        was_renamed = rename_session (old_name, new_name);
++
++        if (was_renamed) {
++                gtk_tree_model_sort_convert_iter_to_child_iter (sort_model, &items_iter, &sort_iter);
++
++                gtk_list_store_set (store, &items_iter, 0, g_strdup (new_name), -1);
++                g_free (old_name);
++                make_session_current (new_name);
++        } else {
++                begin_rename ();
++        }
++
++        gtk_tree_path_free (path);
++
++        g_object_set (cell, "editable", FALSE, NULL);
+ }
+ 
+ static void
+@@ -478,18 +548,6 @@ on_row_activated (GtkTreeView       *tree_view,
+ }
+ 
+ static void
+-on_text_changed (GObject *entry, GParamSpec *pspec, gpointer data)
+-{
+-        GtkWidget *button;
+-        const char *name;
+-
+-        name = gtk_entry_get_text (GTK_ENTRY (entry));
+-
+-        button = (GtkWidget *)gtk_builder_get_object (builder, "name-ok-button");
+-        gtk_widget_set_sensitive (button, is_valid_session_name (name));
+-}
+-
+-static void
+ auto_save_next_session (void)
+ {
+         GConfClient *client;
+@@ -547,7 +605,6 @@ main (int argc, char *argv[])
+ {
+         GtkWidget *window;
+         GtkWidget *widget;
+-        GtkWidget *dialog;
+         GtkCellRenderer *cell;
+         GtkTreeViewColumn *column;
+         GtkTreeSelection *selection;
+@@ -592,29 +649,25 @@ main (int argc, char *argv[])
+         populate_session_list (session_list);
+ 
+         cell = gtk_cell_renderer_text_new ();
++        g_signal_connect (cell, "edited", G_CALLBACK (on_row_edited), NULL);
++
+         column = gtk_tree_view_column_new_with_attributes ("", cell, "text", 0, NULL);
+         gtk_tree_view_append_column (GTK_TREE_VIEW (session_list), GTK_TREE_VIEW_COLUMN (column));
+ 
+         g_signal_connect (session_list, "row-activated", G_CALLBACK (on_row_activated), NULL);
+ 
++
+         g_signal_connect (selection, "changed",
+                           G_CALLBACK (on_selection_changed), NULL);
+ 
+-        widget = (GtkWidget *)gtk_builder_get_object (builder, "name-entry");
+-        g_signal_connect (widget, "notify::text", G_CALLBACK (on_text_changed), NULL);
+-        dialog = (GtkWidget*) gtk_builder_get_object (builder, "name-dialog");
+-
+-        widget = (GtkWidget *) gtk_builder_get_object (builder, "name-ok-button");
+-        g_signal_connect (widget, "clicked", G_CALLBACK (on_name_ok_button_activated), NULL);
+-
+-        widget = (GtkWidget *) gtk_builder_get_object (builder, "name-cancel-button");
+-        g_signal_connect (widget, "clicked", G_CALLBACK (on_name_cancel_button_activated), NULL);
+         widget = (GtkWidget *) gtk_builder_get_object (builder, "new-session");
+-        g_signal_connect (widget, "clicked", G_CALLBACK (on_new_session_activated), NULL);
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_new_session_clicked), NULL);
+         widget = (GtkWidget *) gtk_builder_get_object (builder, "remove-session");
+-        g_signal_connect (widget, "clicked", G_CALLBACK (on_remove_session_activated), NULL);
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_remove_session_clicked), NULL);
++        widget = (GtkWidget *) gtk_builder_get_object (builder, "rename-session");
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_rename_session_clicked), NULL);
+         widget = (GtkWidget *) gtk_builder_get_object (builder, "continue-button");
+-        g_signal_connect (widget, "clicked", G_CALLBACK (on_continue_activated), NULL);
++        g_signal_connect (widget, "clicked", G_CALLBACK (on_continue_clicked), NULL);
+ 
+         gtk_widget_show (window);
+ 
+-- 
+1.6.5.2
+
+
+From c9f4502221fe3e0cd0822890c99deb8c45060ded Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Fri, 18 Jun 2010 17:06:52 -0400
+Subject: [PATCH 7/9] Add infobar thing
+
+---
+ data/session-selector.ui       |  241 +++++++++++++---------------------------
+ tools/gnome-session-selector.c |   71 ++++++++----
+ 2 files changed, 123 insertions(+), 189 deletions(-)
+
+diff --git a/data/session-selector.ui b/data/session-selector.ui
+index 77dc9b8..1c55712 100644
+--- a/data/session-selector.ui
++++ b/data/session-selector.ui
+@@ -25,7 +25,7 @@
+         <child>
+           <object class="GtkAlignment" id="alignment3">
+             <property name="visible">True</property>
+-            <property name="border_width">6</property>
++            <property name="border_width">12</property>
+             <child>
+               <object class="GtkVBox" id="vbox3">
+                 <property name="visible">True</property>
+@@ -33,176 +33,55 @@
+                 <property name="spacing">6</property>
+ 
+                 <child>
+-                  <object class="GtkVBox" id="vbox3">
++                  <object class="GtkInfoBar" id="info-bar">
+                     <property name="visible">True</property>
+-                    <property name="orientation">vertical</property>
+-                    <property name="spacing">12</property>
+-                    <child>
+-                      <object class="GtkVBox" id="vbox4">
++                    <property name="message-type">other</property>
++
++                    <child internal-child="content_area">
++                      <object class="GtkHBox" id="info-bar-content_area">
+                         <property name="visible">True</property>
+                         <property name="orientation">vertical</property>
+-                        <property name="spacing">12</property>
+-                        <child>
+-                          <object class="GtkLabel" id="label4">
+-                            <property name="visible">True</property>
+-                            <property name="xalign">0</property>
+-                            <property name="label" translatable="yes">Please choose a custom session to run:</property>
+-                          </object>
+-                          <packing>
+-                            <property name="expand">False</property>
+-                            <property name="position">0</property>
+-                          </packing>
+-                        </child>
+-                        <child>
+-                          <object class="GtkHBox" id="hbox3">
+-                            <property name="visible">True</property>
+-                            <property name="spacing">12</property>
+-                            <child>
+-                              <object class="GtkScrolledWindow" id="scrolledwindow2">
+-                                <property name="visible">True</property>
+-                                <property name="can_focus">True</property>
+-                                <property name="hscrollbar_policy">never</property>
+-                                <property name="vscrollbar_policy">automatic</property>
+-                                <property name="shadow_type">in</property>
+-                                <child>
+-                                  <object class="GtkTreeView" id="session-list">
+-                                    <property name="visible">True</property>
+-                                    <property name="can_focus">True</property>
+-                                    <property name="headers_visible">False</property>
+-                                    <property name="search_column">0</property>
+-                                    <property name="model">sort-model</property>
+-                                  </object>
+-                                </child>
+-                              </object>
+-                              <packing>
+-                                <property name="position">0</property>
+-                              </packing>
+-                            </child>
+-                            <child>
+-                              <object class="GtkVButtonBox" id="vbuttonbox2">
+-                                <property name="visible">True</property>
+-                                <property name="orientation">vertical</property>
+-                                <property name="spacing">6</property>
+-                                <property name="layout_style">start</property>
+-                                <child>
+-                                  <object class="GtkButton" id="new-session">
+-                                    <property name="label" translatable="yes">_New Session</property>
+-                                    <property name="visible">True</property>
+-                                    <property name="can_focus">True</property>
+-                                    <property name="receives_default">True</property>
+-                                    <property name="use_underline">True</property>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="expand">False</property>
+-                                    <property name="fill">False</property>
+-                                    <property name="position">0</property>
+-                                  </packing>
+-                                </child>
+-                                <child>
+-                                  <object class="GtkButton" id="remove-session">
+-                                    <property name="label" translatable="yes">_Remove Session</property>
+-                                    <property name="visible">True</property>
+-                                    <property name="can_focus">True</property>
+-                                    <property name="receives_default">True</property>
+-                                    <property name="use_underline">True</property>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="expand">False</property>
+-                                    <property name="fill">False</property>
+-                                    <property name="position">1</property>
+-                                  </packing>
+-                                </child>
+-                                <child>
+-                                  <object class="GtkButton" id="rename-session">
+-                                    <property name="label" translatable="yes">Rena_me Session</property>
+-                                    <property name="visible">True</property>
+-                                    <property name="can_focus">True</property>
+-                                    <property name="receives_default">True</property>
+-                                    <property name="use_underline">True</property>
+-                                  </object>
+-                                  <packing>
+-                                    <property name="expand">False</property>
+-                                    <property name="fill">False</property>
+-                                    <property name="position">2</property>
+-                                  </packing>
+-                                </child>
+-                              </object>
+-                              <packing>
+-                                <property name="expand">False</property>
+-                                <property name="position">1</property>
+-                              </packing>
+-                            </child>
+-                          </object>
+-                          <packing>
+-                            <property name="position">1</property>
+-                          </packing>
+-                        </child>
+-                      </object>
+-                      <packing>
+-                        <property name="position">0</property>
+-                      </packing>
+-                    </child>
+-                    <child>
+-                      <object class="GtkHButtonBox" id="hbuttonbox2">
+-                        <property name="visible">True</property>
+-                        <property name="spacing">6</property>
+-                        <property name="layout_style">end</property>
++                        <property name="spacing">0</property>
+                         <child>
+-                          <object class="GtkButton" id="continue-button">
+-                            <property name="label" translatable="yes">_Continue</property>
++                          <object class="GtkLabel" id="info-label">
+                             <property name="visible">True</property>
+-                            <property name="can_focus">True</property>
+-                            <property name="can_default">True</property>
+-                            <property name="has_default">True</property>
+-                            <property name="receives_default">True</property>
+-                            <property name="use_underline">True</property>
++                            <property name="xalign">0.0</property>
++                            <property name="yalign">0.5</property>
++                            <property name="label" translatable="yes">Please select a custom session to run</property>
+                           </object>
+                           <packing>
+-                            <property name="expand">False</property>
+-                            <property name="fill">False</property>
++                            <property name="expand">True</property>
++                            <property name="fill">True</property>
+                             <property name="position">0</property>
+                           </packing>
+                         </child>
+                       </object>
+-                      <packing>
+-                        <property name="expand">False</property>
+-                        <property name="position">1</property>
+-                      </packing>
+                     </child>
+                   </object>
+-                </child>
+-                <child type="tab">
+-                  <placeholder/>
++                  <packing>
++                    <property name="expand">False</property>
++                    <property name="fill">True</property>
++                    <property name="position">0</property>
++                  </packing>
+                 </child>
+                 <child>
+-                  <object class="GtkVBox" id="vbox5">
++                  <object class="GtkVBox" id="vbox4">
+                     <property name="visible">True</property>
+-                    <property name="border_width">5</property>
+                     <property name="orientation">vertical</property>
+-                    <property name="spacing">2</property>
++                    <property name="spacing">12</property>
+                     <child>
+-                      <object class="GtkVBox" id="vbox1">
++                      <object class="GtkHBox" id="hbox3">
+                         <property name="visible">True</property>
+-                        <property name="orientation">vertical</property>
+                         <property name="spacing">12</property>
+                         <child>
+-                          <object class="GtkLabel" id="label2">
++                          <object class="GtkScrolledWindow" id="scrolledwindow2">
+                             <property name="visible">True</property>
+-                            <property name="label" translatable="yes">Please enter a name for the new session.</property>
+-                          </object>
+-                          <packing>
+-                            <property name="expand">False</property>
+-                            <property name="position">0</property>
+-                          </packing>
+-                        </child>
+-                        <child>
+-                          <object class="GtkAlignment" id="alignment1">
+-                            <property name="visible">True</property>
+-                            <property name="xalign">0</property>
+-                            <property name="yalign">0</property>
+-                            <property name="yscale">0</property>
++                            <property name="can_focus">True</property>
++                            <property name="hscrollbar_policy">never</property>
++                            <property name="vscrollbar_policy">automatic</property>
++                            <property name="shadow_type">in</property>
+                             <child>
+-                              <object class="GtkTable" id="table1">
++                              <object class="GtkTreeView" id="session-list">
+                                 <property name="visible">True</property>
+                                 <property name="can_focus">True</property>
+                                 <property name="headers_visible">False</property>
+@@ -212,21 +91,22 @@
+                             </child>
+                           </object>
+                           <packing>
+-                            <property name="position">1</property>
++                            <property name="position">0</property>
+                           </packing>
+                         </child>
+                         <child>
+-                          <object class="GtkHButtonBox" id="hbuttonbox3">
++                          <object class="GtkVButtonBox" id="vbuttonbox2">
+                             <property name="visible">True</property>
++                            <property name="orientation">vertical</property>
+                             <property name="spacing">6</property>
+-                            <property name="layout_style">end</property>
++                            <property name="layout_style">start</property>
+                             <child>
+                               <object class="GtkButton" id="new-session">
+                                 <property name="label" translatable="yes">_New Session</property>
+                                 <property name="visible">True</property>
+                                 <property name="can_focus">True</property>
+                                 <property name="receives_default">True</property>
+-                                <property name="use_stock">True</property>
++                                <property name="use_underline">True</property>
+                               </object>
+                               <packing>
+                                 <property name="expand">False</property>
+@@ -235,14 +115,12 @@
+                               </packing>
+                             </child>
+                             <child>
+-                              <object class="GtkButton" id="name-ok-button">
+-                                <property name="label">gtk-ok</property>
++                              <object class="GtkButton" id="remove-session">
++                                <property name="label" translatable="yes">_Remove Session</property>
+                                 <property name="visible">True</property>
+                                 <property name="can_focus">True</property>
+-                                <property name="can_default">True</property>
+-                                <property name="has_default">True</property>
+                                 <property name="receives_default">True</property>
+-                                <property name="use_stock">True</property>
++                                <property name="use_underline">True</property>
+                               </object>
+                               <packing>
+                                 <property name="expand">False</property>
+@@ -250,15 +128,29 @@
+                                 <property name="position">1</property>
+                               </packing>
+                             </child>
++                            <child>
++                              <object class="GtkButton" id="rename-session">
++                                <property name="label" translatable="yes">Rena_me Session</property>
++                                <property name="visible">True</property>
++                                <property name="can_focus">True</property>
++                                <property name="receives_default">True</property>
++                                <property name="use_underline">True</property>
++                              </object>
++                              <packing>
++                                <property name="expand">False</property>
++                                <property name="fill">False</property>
++                                <property name="position">2</property>
++                              </packing>
++                            </child>
+                           </object>
+                           <packing>
+                             <property name="expand">False</property>
+-                            <property name="position">2</property>
++                            <property name="position">1</property>
+                           </packing>
+                         </child>
+                       </object>
+                       <packing>
+-                        <property name="position">0</property>
++                        <property name="position">1</property>
+                       </packing>
+                     </child>
+                   </object>
+@@ -266,16 +158,37 @@
+                     <property name="position">1</property>
+                   </packing>
+                 </child>
+-                <child type="tab">
+-                  <placeholder/>
++                <child>
++                  <object class="GtkHButtonBox" id="hbuttonbox2">
++                    <property name="visible">True</property>
++                    <property name="spacing">6</property>
++                    <property name="layout_style">end</property>
++                    <child>
++                      <object class="GtkButton" id="continue-button">
++                        <property name="label" translatable="yes">_Continue</property>
++                        <property name="visible">True</property>
++                        <property name="can_focus">True</property>
++                        <property name="can_default">True</property>
++                        <property name="has_default">True</property>
++                        <property name="receives_default">True</property>
++                        <property name="use_underline">True</property>
++                      </object>
++                      <packing>
++                        <property name="expand">False</property>
++                        <property name="fill">False</property>
++                        <property name="position">0</property>
++                      </packing>
++                    </child>
++                  </object>
++                  <packing>
++                    <property name="expand">False</property>
++                    <property name="position">2</property>
++                  </packing>
+                 </child>
+               </object>
+             </child>
+           </object>
+         </child>
+-        <child type="label_item">
+-          <placeholder/>
+-        </child>
+       </object>
+     </child>
+   </object>
+diff --git a/tools/gnome-session-selector.c b/tools/gnome-session-selector.c
+index 96fb274..0c2cd63 100644
+--- a/tools/gnome-session-selector.c
++++ b/tools/gnome-session-selector.c
+@@ -75,53 +75,74 @@ find_new_session_name (void)
+ static gboolean
+ is_valid_session_name (const char *name)
+ {
+-        GtkWidget *warning;
+-        GtkWidget *label;
+         GtkTreeIter iter;
+         char *n;
+-        char *text;
+-
+-        warning = (GtkWidget*) gtk_builder_get_object (builder, "name-invalid-box");
+-        label = (GtkWidget*) gtk_builder_get_object (builder, "name-invalid-label");
+-        gtk_widget_hide (warning);
++        const char *info_text;
++        char *warning_text;
++        gboolean user_tried_dot;
++        gboolean user_tried_slash;
++        GtkWidget *info_bar;
++        GtkWidget *label;
+ 
+         if (name[0] == 0) {
+                 return FALSE;
+         }
+ 
+         if (name[0] == '.') {
+-                text = g_strdup_printf ("<small><i>%s</i></small>", _("Session names are not allowed\nto start with a '.' character"));
+-                gtk_label_set_markup (GTK_LABEL (label), text);
+-                gtk_widget_show (warning);
+-                g_free (text);
+-
+-                return FALSE;
++            user_tried_dot = TRUE;
++        } else {
++            user_tried_dot = FALSE;
+         }
+ 
+-        if (strchr (name, '/')) {
+-                text = g_strdup_printf ("<small><i>%s</i></small>", _("Session names are not allowed\nto contain '/' characters"));
+-                gtk_label_set_markup (GTK_LABEL (label), text);
+-                gtk_widget_show (warning);
+-                g_free (text);
++        if (strchr (name, '/') != NULL) {
++            user_tried_slash = TRUE;
++        } else {
++            user_tried_slash = FALSE;
++        }
+ 
+-                return FALSE;
++        info_text = _("Please select a custom session to run");
++        warning_text = NULL;
++        if (user_tried_dot && user_tried_slash) {
++            warning_text = g_strdup_printf ("%s\n<small><b>Note:</b> <i>%s</i></small>",
++                                            info_text,
++                                            _("Session names are not allowed to start with ‘.’ or contain ‘/’ characters"));
++        } else if (user_tried_dot) {
++            warning_text = g_strdup_printf ("%s\n<small><b>Note:</b> <i>%s</i></small>",
++                                            info_text,
++                                            _("Session names are not allowed to start with ‘.’"));
++        } else if (user_tried_slash) {
++            warning_text = g_strdup_printf ("%s\n<small><b>Note:</b> <i>%s</i></small>",
++                                            info_text,
++                                            _("Session names are not allowed to contain ‘/’ characters"));
+         }
+ 
+         gtk_tree_model_get_iter_first (GTK_TREE_MODEL (store), &iter);
+         do {
+                 gtk_tree_model_get (GTK_TREE_MODEL (store), &iter, 0, &n, -1);
+                 if (strcmp (n, name) == 0) {
+-                        text = g_strdup_printf ("<small><i>%s</i></small>", _("A session with this name\nalready exists"));
+-                        gtk_label_set_markup (GTK_LABEL (label), text);
+-                        gtk_widget_show (warning);
+-                        g_free (text);
+-
++                        char *message;
++                        message = g_strdup_printf (_("A session named ‘%s’ already exists"), name);
++                        warning_text = g_strdup_printf ("%s\n<small><b>Note:</b> <i>%s</i></small>", info_text, message);
++                        g_free (message);
+                         g_free (n);
+-                        return FALSE;
++                        break;
+                 }
+                 g_free (n);
+         } while (gtk_tree_model_iter_next (GTK_TREE_MODEL (store), &iter));
+ 
++        info_bar = (GtkWidget *) gtk_builder_get_object (builder, "info-bar");
++        label = (GtkWidget*) gtk_builder_get_object (builder, "info-label");
++
++        if (warning_text != NULL) {
++            gtk_info_bar_set_message_type (GTK_INFO_BAR (info_bar), GTK_MESSAGE_WARNING);
++            gtk_label_set_markup (GTK_LABEL (label), warning_text);
++            g_free (warning_text);
++            return FALSE;
++        }
++
++        gtk_info_bar_set_message_type (GTK_INFO_BAR (info_bar), GTK_MESSAGE_OTHER);
++        gtk_label_set_markup (GTK_LABEL (label), info_text);
++
+         return TRUE;
+ }
+ 
+-- 
+1.6.5.2
+
+
+From b4886cca519a26096d101ac32164a7e536059cde Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Fri, 18 Jun 2010 17:40:43 -0400
+Subject: [PATCH 8/9] Fix up session selector to keep focus without window manager
+
+X defaults to focus-follows-mouse if no window manager is running.
+
+This commit fixes the selector dialog to grab input focus explicitly,
+so it doesn't disappear if the user moves their mouse pointer outside
+the window.
+---
+ tools/gnome-session-selector.c |    8 ++++++++
+ 1 files changed, 8 insertions(+), 0 deletions(-)
+
+diff --git a/tools/gnome-session-selector.c b/tools/gnome-session-selector.c
+index 0c2cd63..386db51 100644
+--- a/tools/gnome-session-selector.c
++++ b/tools/gnome-session-selector.c
+@@ -621,6 +621,13 @@ compare_sessions (GtkTreeModel *model,
+     return result;
+ }
+ 
++static void
++on_map (GtkWidget *widget,
++        gpointer   data)
++{
++        gdk_window_focus (gtk_widget_get_window (widget), GDK_CURRENT_TIME);
++}
++
+ int
+ main (int argc, char *argv[])
+ {
+@@ -690,6 +697,7 @@ main (int argc, char *argv[])
+         widget = (GtkWidget *) gtk_builder_get_object (builder, "continue-button");
+         g_signal_connect (widget, "clicked", G_CALLBACK (on_continue_clicked), NULL);
+ 
++        g_signal_connect (window, "map", G_CALLBACK (on_map), NULL);
+         gtk_widget_show (window);
+ 
+         gtk_main ();
+-- 
+1.6.5.2
+
+
+From 030812d2ad1f25ce5ee2b9295c2d1c5aefa16d79 Mon Sep 17 00:00:00 2001
+From: Ray Strode <rstrode@redhat.com>
+Date: Mon, 21 Jun 2010 15:16:47 -0400
+Subject: [PATCH 9/9] Clear one-shot key on save, not logout
+
+Right now save only happens at logout, but in the future
+after https://bugzilla.gnome.org/show_bug.cgi?id=575544
+is resolved, it will be able to happen at other times
+as well.
+
+This commit moves the one_shot checking code to a more
+proper place, so it will continue to work if bug 575544
+ever lands.
+---
+ gnome-session/gsm-manager.c      |   14 --------------
+ gnome-session/gsm-session-save.c |   27 +++++++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 14 deletions(-)
+
+diff --git a/gnome-session/gsm-manager.c b/gnome-session/gsm-manager.c
+index d550f70..e92ef75 100644
+--- a/gnome-session/gsm-manager.c
++++ b/gnome-session/gsm-manager.c
+@@ -403,25 +403,11 @@ quit_request_completed (GsmConsolekit *consolekit,
+ static void
+ gsm_manager_quit (GsmManager *manager)
+ {
+-        GError *error;
+         GsmConsolekit *consolekit;
+ 
+         /* See the comment in request_reboot() for some more details about how
+          * this works. */
+ 
+-        /* Clear one shot key autosave in the event its set (so that it's actually
+-         * one shot only)
+-         */
+-        error = NULL;
+-        if (!gconf_client_set_bool (manager->priv->gconf_client,
+-                                    KEY_AUTOSAVE_ONE_SHOT,
+-                                    FALSE,
+-                                    &error)) {
+-                g_warning ("Error clearing configuration key '%s': %s",
+-                           KEY_AUTOSAVE_ONE_SHOT,
+-                           error->message);
+-        }
+-
+         switch (manager->priv->logout_type) {
+         case GSM_MANAGER_LOGOUT_LOGOUT:
+                 gtk_main_quit ();
+diff --git a/gnome-session/gsm-session-save.c b/gnome-session/gsm-session-save.c
+index 845ff32..2a9f10f 100644
+--- a/gnome-session/gsm-session-save.c
++++ b/gnome-session/gsm-session-save.c
+@@ -26,9 +26,13 @@
+ #include "gsm-util.h"
+ #include "gsm-autostart-app.h"
+ #include "gsm-client.h"
++#include <gconf/gconf-client.h>
+ 
+ #include "gsm-session-save.h"
+ 
++#define KEY_GNOME_SESSION_DIR     "/apps/gnome-session/options"
++#define KEY_AUTOSAVE_ONE_SHOT     KEY_GNOME_SESSION_DIR "/auto_save_session_one_shot"
++
+ static gboolean gsm_session_clear_saved_session (const char *directory,
+                                                  GHashTable *discard_hash);
+ 
+@@ -117,11 +121,34 @@ void
+ gsm_session_save (GsmStore  *client_store,
+                   GError   **error)
+ {
++        GConfClient     *gconf_client;
+         const char      *save_dir;
+         SessionSaveData  data;
+ 
+         g_debug ("GsmSessionSave: Saving session");
+ 
++        gconf_client = gconf_client_get_default ();
++
++        if (gconf_client != NULL) {
++                GError *gconf_error;
++
++                /* Clear one shot key autosave in the event its set (so that it's actually
++                 * one shot only)
++                 */
++                gconf_error = NULL;
++                if (!gconf_client_set_bool (gconf_client,
++                                            KEY_AUTOSAVE_ONE_SHOT,
++                                            FALSE,
++                                            &gconf_error)) {
++                        g_warning ("Error clearing configuration key '%s': %s",
++                                   KEY_AUTOSAVE_ONE_SHOT,
++                                   gconf_error->message);
++                        g_error_free (gconf_error);
++                }
++
++                g_object_unref (gconf_client);
++        }
++
+         save_dir = gsm_util_get_saved_session_dir ();
+         if (save_dir == NULL) {
+                 g_warning ("GsmSessionSave: cannot create saved session directory");
+-- 
+1.6.5.2
+

@@ -1,0 +1,31 @@
+diff -up gnome-session-2.28.0/doc/man/gnome-session-save.1.fix-up gnome-session-2.28.0/doc/man/gnome-session-save.1
+--- gnome-session-2.28.0/doc/man/gnome-session-save.1.fix-up	2010-07-06 16:42:43.871842948 -0400
++++ gnome-session-2.28.0/doc/man/gnome-session-save.1	2010-07-06 16:44:48.332756407 -0400
+@@ -4,13 +4,13 @@
+ .\"
+ .TH GNOME-SESSION-SAVE 1 "GNOME"
+ .SH NAME
+-gnome-session-save \- Saves or ends the current GNOME session
++gnome-session-save \- Ends the current GNOME session
+ .SH SYNOPSIS
+ .B gnome-session-save [\-\-logout] [\-\-force\-logout] [\-\-logout\-dialog] [\-\-shutdown\-dialog] [\-\-gui] [\-\-kill [\-\-silent]]
+ .SH DESCRIPTION
+-\fIgnome-session-save\fP can be used from a GNOME session to save a snapshot
+-of the currently running applications.  This session will be later
+-restored at your next GNOME session.
++\fIgnome-session-save\fP can be used to log out of a GNOME session.  It's
++called \fIgnome-session-save\fP instead of gnome-session-logout for historical
++reasons.
+ .PP
+ The \fB\-\-gui\fP option will report errors in dialog boxes instead of
+ printing to stderr.
+@@ -30,9 +30,6 @@ The \fB\-\-kill\fP and \fB\-\-silent\fP 
+ option.  If \fB\-\-silent\fP is used with \fB\-\-kill\fR, then it will
+ behave as if \fB\-\-logout\fP was used.
+ 
+-The session is not saved when \fIgnome-session-save\fP is called with any of
+-the options ending the session.
+-
+ .SH SEE ALSO
+ .BR gnome-session(1)
+ .SH BUGS
